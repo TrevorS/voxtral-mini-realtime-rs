@@ -4,6 +4,7 @@
 
 use burn::config::Config;
 use burn::module::Module;
+use burn::prelude::ElementConversion;
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor};
 
@@ -111,7 +112,46 @@ impl<B: Backend> VoxtralModel<B> {
         self.adapter.forward(reshaped)
     }
 
-    /// Full forward pass from mel spectrogram to logits.
+    /// Full forward pass from mel spectrogram to logits (streaming transcription mode).
+    ///
+    /// Per vLLM's Voxtral Realtime implementation:
+    /// 1. Encode audio → audio_embeds
+    /// 2. Embed streaming pad tokens → text_embeds
+    /// 3. Add them: inputs = audio_embeds + text_embeds
+    /// 4. Pass through decoder with t_cond
+    ///
+    /// # Arguments
+    /// * `mel` - Mel spectrogram [batch, n_mels, time]
+    /// * `token_ids` - Streaming pad token IDs [batch, seq] (should be [STREAMING_PAD] = 32)
+    /// * `t_embed_decoder` - Temporal embedding for decoder [batch, 1, decoder_d_model]
+    ///
+    /// # Returns
+    /// Logits [batch, seq, vocab_size]
+    pub fn forward_streaming(
+        &self,
+        mel: Tensor<B, 3>,
+        token_ids: Tensor<B, 2, burn::tensor::Int>,
+        t_embed_decoder: Tensor<B, 3>,
+    ) -> Tensor<B, 3> {
+        // Encode audio
+        let audio_embeds = self.encode_audio(mel);
+
+        // Get text embeddings for streaming pad tokens
+        let text_embeds = self.decoder.embed_tokens(token_ids);
+
+        // Sum pool audio and text embeddings (per vLLM)
+        let inputs_embeds = audio_embeds + text_embeds;
+
+        // Decode through LLM
+        let hidden = self
+            .decoder
+            .forward_hidden(inputs_embeds, t_embed_decoder, 0);
+
+        // Compute logits
+        self.decoder.lm_head(hidden)
+    }
+
+    /// Full forward pass from mel spectrogram to logits (legacy mode without text).
     ///
     /// # Arguments
     /// * `mel` - Mel spectrogram [batch, n_mels, time]
@@ -226,6 +266,128 @@ impl<B: Backend> VoxtralModel<B> {
             .decoder
             .forward_with_cache(token_ids, t_embed, decoder_cache);
         self.decoder.lm_head(hidden)
+    }
+
+    /// Streaming transcription with KV cache - autoregressive generation from audio.
+    ///
+    /// Uses KV caching for O(n) inference complexity instead of O(n²).
+    ///
+    /// # IMPORTANT: Position 38 Anomaly
+    ///
+    /// The standard prefix is 39 tokens (BOS + 38 `[STREAMING_PAD]`), but position 38
+    /// exhibits anomalous behavior when it's the last position. The model predicts
+    /// `[STREAMING_PAD]` regardless of audio content because position 38 =
+    /// n_left_pad_tokens(32) + num_delay_tokens(6) is exactly at the trained boundary.
+    ///
+    /// **Solution**: Use prefix length **38** (one less than standard) for generation.
+    /// Position 37 correctly predicts `[STREAMING_WORD]` and transcription works.
+    ///
+    /// # Token Meanings
+    ///
+    /// - `32` = `[STREAMING_PAD]` - silence/pause between words
+    /// - `33` = `[STREAMING_WORD]` - start of a word (next tokens will be text)
+    /// - `≥1000` = text tokens (actual transcription content)
+    ///
+    /// # Arguments
+    /// * `mel` - Mel spectrogram [batch, n_mels, time]
+    /// * `t_embed_decoder` - Temporal embedding [batch, 1, d_model] (use t=6.0)
+    ///
+    /// # Returns
+    /// Vector of generated token IDs (including control tokens)
+    pub fn transcribe_streaming(
+        &self,
+        mel: Tensor<B, 3>,
+        t_embed_decoder: Tensor<B, 3>,
+    ) -> Vec<i32> {
+        let device = mel.device();
+
+        // Encode audio
+        let audio_embeds = self.encode_audio(mel.clone());
+        let seq_len = audio_embeds.dims()[1];
+
+        // Use prefix length 38 (not 39!) to avoid position 38 anomaly
+        const PREFIX_LEN: usize = 38;
+        const BOS_TOKEN: i32 = 1;
+        const STREAMING_PAD: i32 = 32;
+
+        // Build prefix: BOS + 37 STREAMING_PAD = 38 tokens
+        let mut prefix: Vec<i32> = vec![BOS_TOKEN];
+        prefix.extend(std::iter::repeat_n(STREAMING_PAD, PREFIX_LEN - 1));
+
+        // Embed prefix tokens - create 2D tensor [1, PREFIX_LEN]
+        let prefix_tensor = Tensor::<B, 2, Int>::from_data(
+            burn::tensor::TensorData::new(prefix.clone(), [1, PREFIX_LEN]),
+            &device,
+        );
+        let prefix_text_embeds = self.decoder.embed_tokens(prefix_tensor);
+
+        // Slice audio embeddings for prefix positions
+        let prefix_audio =
+            audio_embeds
+                .clone()
+                .slice([0..1, 0..PREFIX_LEN, 0..audio_embeds.dims()[2]]);
+
+        // Combine for prefix
+        let prefix_inputs = prefix_audio + prefix_text_embeds;
+
+        // Create KV cache for decoder - enables O(n) inference instead of O(n²)
+        let mut decoder_cache = self.create_decoder_cache();
+
+        // Run forward for prefix (fills cache with PREFIX_LEN positions)
+        let hidden = self.decoder.forward_hidden_with_cache(
+            prefix_inputs,
+            t_embed_decoder.clone(),
+            &mut decoder_cache,
+        );
+        let logits = self.decoder.lm_head(hidden);
+
+        // Get prediction at last prefix position (37) - this predicts token 38
+        let last_logits =
+            logits
+                .clone()
+                .slice([0..1, (PREFIX_LEN - 1)..PREFIX_LEN, 0..logits.dims()[2]]);
+        let first_pred = last_logits.argmax(2);
+        let first_token: i32 = first_pred.into_scalar().elem();
+
+        let mut generated = prefix.clone();
+        generated.push(first_token);
+
+        // Autoregressive generation with KV cache (O(n) per step)
+        for pos in PREFIX_LEN + 1..seq_len {
+            // Only embed the SINGLE new token
+            let new_token = generated[pos - 1];
+            let token_tensor = Tensor::<B, 2, Int>::from_data(
+                burn::tensor::TensorData::new(vec![new_token], [1, 1]),
+                &device,
+            );
+            let text_embed = self.decoder.embed_tokens(token_tensor);
+
+            // Only slice the SINGLE new audio position
+            let audio_pos =
+                audio_embeds
+                    .clone()
+                    .slice([0..1, (pos - 1)..pos, 0..audio_embeds.dims()[2]]);
+
+            // Combine single position
+            let input = audio_pos + text_embed;
+
+            // Forward with cache - processes 1 token, reuses cached KV
+            let hidden = self.decoder.forward_hidden_with_cache(
+                input,
+                t_embed_decoder.clone(),
+                &mut decoder_cache,
+            );
+            let logits = self.decoder.lm_head(hidden);
+
+            // Get prediction (logits shape is [1, 1, vocab])
+            let pred = logits.argmax(2);
+            let next_token: i32 = pred.into_scalar().elem();
+
+            generated.push(next_token);
+        }
+
+        // Return generated tokens (skip prefix)
+        generated.into_iter().skip(PREFIX_LEN).collect()
     }
 
     /// Get encoder configuration.

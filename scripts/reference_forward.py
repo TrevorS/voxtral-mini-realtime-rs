@@ -274,8 +274,16 @@ def test_attention():
 
 
 def test_ada_rms_norm():
-    """Test ADA RMSNorm from LLM layer."""
-    print("\n=== Testing ADA RMSNorm ===")
+    """Test ADA modulation layer from LLM layer (NOT a normalization layer).
+
+    Per vLLM implementation, this is just:
+        x * (1 + ada_rms_norm_t_cond(t_cond))
+
+    Where ada_rms_norm_t_cond is: Linear -> GELU -> Linear
+
+    The actual RMSNorm happens separately in attention_norm/ffn_norm.
+    """
+    print("\n=== Testing ADA Modulation ===")
 
     with safe_open(MODEL_PATH, framework="pt", device="cpu") as f:
         w0 = load_weight(f, "layers.0.ada_rms_norm_t_cond.0.weight")  # [32, 3072]
@@ -284,7 +292,7 @@ def test_ada_rms_norm():
     print(f"  w0 shape: {list(w0.shape)} (Linear: dim -> t_cond_dim)")
     print(f"  w2 shape: {list(w2.shape)} (Linear: t_cond_dim -> dim)")
 
-    # The structure is: Linear(dim, t_cond_dim) -> SiLU -> Linear(t_cond_dim, dim)
+    # The structure is: Linear(dim, t_cond_dim) -> GELU -> Linear(t_cond_dim, dim)
     # This produces per-element scaling factors
 
     dim = 3072
@@ -293,21 +301,17 @@ def test_ada_rms_norm():
 
     torch.manual_seed(42)
     x = torch.randn(1, seq_len, dim)
-    t_embed = torch.randn(1, 1, dim)  # Temporal embedding
+    t_embed = torch.randn(1, 1, dim)  # Temporal embedding / conditioning
 
-    # Compute adaptive scale
+    # Compute adaptive scale using GELU (not SiLU!)
     scale = F.linear(t_embed, w0)  # [1, 1, 32]
-    scale = F.silu(scale)
+    scale = F.gelu(scale)  # GELU activation per vLLM
     scale = F.linear(scale, w2)  # [1, 1, 3072]
 
-    # Apply RMSNorm with adaptive scale
-    # First compute standard RMSNorm
-    variance = x.pow(2).mean(-1, keepdim=True)
-    x_norm = x * torch.rsqrt(variance + 1e-5)
-
-    # Then apply adaptive scale (no learnable weight - just scale)
-    # The adaptive modulation is: (1 + scale) * x_norm
-    out = x_norm * (1 + scale)
+    # Apply adaptive modulation: x * (1 + scale)
+    # NOTE: This is NOT normalization - just modulation
+    # The actual RMSNorm happens separately in attention_norm/ffn_norm
+    out = x * (1 + scale)
 
     save_tensor("ada_rms_norm_input", x)
     save_tensor("ada_rms_norm_t_embed", t_embed)

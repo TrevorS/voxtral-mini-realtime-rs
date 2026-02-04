@@ -40,10 +40,13 @@ pub struct DecoderLayerConfig {
 ///
 /// Architecture (Pre-LN with ADA modulation):
 /// ```text
-/// x -> ADA_RMSNorm(x, t_embed) -> Attention -> + -> x'
-///                                              |
-/// x' -> RMSNorm -> SwiGLU -> + -> out
+/// x -> RMSNorm -> Attention -> + -> x'
+///                              |
+/// x' -> RMSNorm -> ADA_mod(t_embed) -> SwiGLU -> + -> out
 /// ```
+///
+/// The ADA modulation happens AFTER ffn_norm and BEFORE the MLP,
+/// per vLLM's implementation: hidden_states * (1 + ada_rms_norm_t_cond(t_cond))
 ///
 /// Key differences from encoder:
 /// - Uses GQA (32 query heads, 8 KV heads)
@@ -171,9 +174,6 @@ impl<B: Backend> DecoderLayer<B> {
         rope: &RoPE<B>,
         offset: usize,
     ) -> Tensor<B, 3> {
-        // First apply ADA RMSNorm modulation
-        let x = self.ada_rms_norm.forward(x, t_embed);
-
         // Attention with residual
         let residual = x.clone();
         let x = self.attention_norm.forward(x);
@@ -181,8 +181,10 @@ impl<B: Backend> DecoderLayer<B> {
         let x = x + residual;
 
         // MLP with residual
+        // ADA modulation happens AFTER ffn_norm and BEFORE MLP (per vLLM)
         let residual = x.clone();
         let x = self.ffn_norm.forward(x);
+        let x = self.ada_rms_norm.forward(x, t_embed.clone());
         let x = self.ffn.forward(x);
         x + residual
     }
@@ -204,9 +206,6 @@ impl<B: Backend> DecoderLayer<B> {
         rope: &RoPE<B>,
         cache: &mut KVCache<B>,
     ) -> Tensor<B, 3> {
-        // First apply ADA RMSNorm modulation
-        let x = self.ada_rms_norm.forward(x, t_embed);
-
         // Attention with residual
         let residual = x.clone();
         let x = self.attention_norm.forward(x);
@@ -214,8 +213,10 @@ impl<B: Backend> DecoderLayer<B> {
         let x = x + residual;
 
         // MLP with residual
+        // ADA modulation happens AFTER ffn_norm and BEFORE MLP (per vLLM)
         let residual = x.clone();
         let x = self.ffn_norm.forward(x);
+        let x = self.ada_rms_norm.forward(x, t_embed.clone());
         let x = self.ffn.forward(x);
         x + residual
     }

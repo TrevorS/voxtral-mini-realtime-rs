@@ -6,7 +6,7 @@
 use burn::config::Config;
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig};
-use burn::tensor::activation::silu;
+use burn::tensor::activation::gelu;
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 
@@ -58,10 +58,13 @@ pub struct AdaRmsNormConfig {
     pub eps: f64,
 }
 
-/// Adaptive RMSNorm with temporal conditioning.
+/// Adaptive modulation layer with temporal conditioning.
 ///
-/// Architecture: Linear(d_model -> t_cond_dim) -> SiLU -> Linear(t_cond_dim -> d_model)
-/// Then applies: `rms_norm(x) * (1 + scale)`
+/// Architecture: Linear(d_model -> t_cond_dim) -> GELU -> Linear(t_cond_dim -> d_model)
+/// Then applies: `x * (1 + scale)`
+///
+/// Note: This is NOT a normalization layer - it only applies modulation.
+/// The actual RMSNorm happens separately in attention_norm/ffn_norm.
 #[derive(Module, Debug)]
 pub struct AdaRmsNorm<B: Backend> {
     /// First projection: d_model -> t_cond_dim
@@ -102,19 +105,17 @@ impl<B: Backend> AdaRmsNorm<B> {
     /// * `t_embed` - Temporal embedding [batch, 1, d_model]
     ///
     /// # Returns
-    /// Normalized tensor [batch, seq, d_model]
+    /// Modulated tensor [batch, seq, d_model] (not normalized - just scaled)
     pub fn forward(&self, x: Tensor<B, 3>, t_embed: Tensor<B, 3>) -> Tensor<B, 3> {
-        // Compute adaptive scale: Linear -> SiLU -> Linear
+        // Compute adaptive scale: Linear -> GELU -> Linear
+        // t_embed: [batch, 1, d_model] -> w0 -> [batch, 1, t_cond_dim]
         let scale = self.w0.forward(t_embed);
-        let scale = silu(scale);
+        let scale = gelu(scale);
         let scale = self.w2.forward(scale); // [batch, 1, d_model]
 
-        // Apply RMSNorm: x / sqrt(mean(x^2) + eps)
-        let variance = x.clone().powf_scalar(2.0).mean_dim(2); // [batch, seq, 1]
-        let x_norm = x / (variance + self.eps).sqrt();
-
-        // Apply adaptive modulation: (1 + scale) * x_norm
-        x_norm * (scale + 1.0)
+        // Apply adaptive modulation: x * (1 + scale)
+        // Note: This is NOT normalization - the actual RMSNorm happens separately
+        x * (scale + 1.0)
     }
 }
 
@@ -210,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ada_rms_norm_vs_reference() {
+    fn test_ada_modulation_vs_reference() {
         use crate::test_utils::{load_test_data, test_data_exists};
 
         if !test_data_exists("ada_rms_norm_input") {
@@ -255,24 +256,19 @@ mod tests {
         // w2: [3072, 32] -> transpose
         let w2 = Tensor::<TestBackend, 2>::from_data(TensorData::new(w2_data, [3072, 32]), &device);
 
-        // Manual ADA RMSNorm
-        let eps = 1e-5f32;
-
-        // Compute scale: t_embed @ w0.T -> silu -> @ w2.T
+        // Manual ADA modulation (NOT normalization!)
+        // Compute scale: t_embed @ w0.T -> GELU -> @ w2.T
         // t_embed: [1, 1, 3072], w0: [32, 3072]
         // For matmul: [1, 1, 3072] @ [1, 3072, 32] -> [1, 1, 32]
         let w0_3d = w0.transpose().unsqueeze::<3>(); // [1, 3072, 32]
         let w2_3d = w2.transpose().unsqueeze::<3>(); // [1, 32, 3072]
         let scale = t_embed.matmul(w0_3d);
-        let scale = silu(scale);
+        let scale = gelu(scale); // GELU not SiLU!
         let scale = scale.matmul(w2_3d); // [1, 1, 3072]
 
-        // RMSNorm
-        let variance = input.clone().powf_scalar(2.0).mean_dim(2);
-        let x_norm = input / (variance + eps).sqrt();
-
-        // Apply modulation
-        let output = x_norm * (scale + 1.0);
+        // Apply modulation: x * (1 + scale)
+        // NOTE: No RMSNorm here - that happens separately
+        let output = input * (scale + 1.0);
 
         // Compare
         let output_data = output.to_data();
@@ -286,10 +282,10 @@ mod tests {
             max_diff = max_diff.max((a - b).abs());
         }
 
-        println!("ADA RMSNorm max diff: {:.2e}", max_diff);
+        println!("ADA modulation max diff: {:.2e}", max_diff);
         assert!(
             max_diff < 1e-3,
-            "ADA RMSNorm max diff {:.2e} exceeds tolerance",
+            "ADA modulation max diff {:.2e} exceeds tolerance",
             max_diff
         );
     }

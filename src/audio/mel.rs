@@ -121,9 +121,9 @@ impl MelSpectrogram {
     /// Returns a 2D vector of shape `[n_frames, n_mels]` with log-compressed
     /// and normalized values in roughly [-1, 1] range.
     ///
-    /// Normalization follows Whisper's audio.py:
+    /// Normalization follows vLLM's Voxtral implementation:
     /// 1. log10(mel) with floor at 1e-10
-    /// 2. Dynamic range limit: max(log_spec, max_val - 8.0)
+    /// 2. Dynamic range limit using global_log_mel_max (or per-audio max if not set)
     /// 3. Linear scale: (log_spec + 4.0) / 4.0
     pub fn compute_log(&self, samples: &[f32]) -> Vec<Vec<f32>> {
         let mel = self.compute(samples);
@@ -134,13 +134,18 @@ impl MelSpectrogram {
             .map(|frame| frame.into_iter().map(|v| v.max(1e-10).log10()).collect())
             .collect();
 
-        // Step 2: Find global max and apply dynamic range limit (8.0 range)
-        let global_max: f32 = log_mel
-            .iter()
-            .flat_map(|frame| frame.iter())
-            .cloned()
-            .fold(f32::NEG_INFINITY, f32::max);
-        let min_val = global_max - 8.0;
+        // Step 2: Apply dynamic range limit
+        // Use global_log_mel_max if set (1.5 for Voxtral Realtime), otherwise compute from audio
+        let log_spec_max = if self.config.log_mel_max > 0.0 {
+            self.config.log_mel_max
+        } else {
+            log_mel
+                .iter()
+                .flat_map(|frame| frame.iter())
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max)
+        };
+        let min_val = log_spec_max - 8.0;
 
         for frame in &mut log_mel {
             for v in frame.iter_mut() {
@@ -148,10 +153,11 @@ impl MelSpectrogram {
             }
         }
 
-        // Step 3: Linear scale to roughly [-1, 1] and clamp
+        // Step 3: Linear scale to roughly [-1, 1]
+        // Note: vLLM doesn't clamp, but Whisper does. Following vLLM for Voxtral.
         for frame in &mut log_mel {
             for v in frame.iter_mut() {
-                *v = ((*v + 4.0) / 4.0).clamp(-1.0, 1.0);
+                *v = (*v + 4.0) / 4.0;
             }
         }
 
@@ -167,9 +173,12 @@ impl MelSpectrogram {
 
     /// Number of frames for a given number of samples.
     pub fn num_frames(&self, num_samples: usize) -> usize {
-        let pad_length = (self.config.n_fft - self.config.hop_length) / 2;
+        // Matches torch.stft center=True behavior, minus 1 to match Voxtral's
+        // magnitudes = stft[..., :-1] which drops the last frame
+        let pad_length = self.config.n_fft / 2;
         let padded_len = num_samples + 2 * pad_length;
-        (padded_len - self.config.n_fft) / self.config.hop_length + 1
+        // Drop last frame to match Python reference
+        (padded_len - self.config.n_fft) / self.config.hop_length
     }
 
     /// Short-time Fourier transform.
@@ -178,8 +187,9 @@ impl MelSpectrogram {
         let hop_length = self.config.hop_length;
         let win_length = self.window.len();
 
-        // Reflect-pad signal (center=True behavior)
-        let pad_length = (n_fft - hop_length) / 2;
+        // Reflect-pad signal (center=True behavior, matching torch.stft)
+        // torch.stft pads by n_fft//2 on each side
+        let pad_length = n_fft / 2;
         let mut padded = Vec::with_capacity(pad_length + samples.len() + pad_length);
 
         // Left reflect padding
@@ -198,7 +208,8 @@ impl MelSpectrogram {
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(n_fft);
 
-        let n_frames = (padded.len() - n_fft) / hop_length + 1;
+        // Drop last frame to match Python's magnitudes = stft[..., :-1]
+        let n_frames = (padded.len() - n_fft) / hop_length;
         let mut result = Vec::with_capacity(n_frames);
 
         for i in 0..n_frames {
@@ -327,7 +338,10 @@ impl MelSpectrogram {
         filterbank
     }
 
-    /// Create Hann window.
+    /// Create Hann window (periodic mode, matching torch.hann_window default).
+    ///
+    /// Uses periodic formula: 0.5 * (1 - cos(2*pi*n/N)) for n in [0, N)
+    /// This matches torch.hann_window(N, periodic=True) which is the default.
     fn hann_window(length: usize) -> Vec<f32> {
         (0..length)
             .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / length as f32).cos()))
@@ -371,7 +385,24 @@ mod tests {
         let window = MelSpectrogram::hann_window(4);
         assert_eq!(window.len(), 4);
         assert!((window[0] - 0.0).abs() < 1e-6);
-        assert!((window[2] - 1.0).abs() < 1e-6);
+        // For periodic window of length 4: [0, 0.5, 1, 0.5]
+        // For symmetric: [0, 0.75, 0.75, 0]
+        // Check we have periodic
+        assert!(
+            (window[2] - 1.0).abs() < 1e-6,
+            "Expected window[2]=1.0 (periodic), got {}",
+            window[2]
+        );
+
+        // Test 400-length window matches torch periodic
+        let window400 = MelSpectrogram::hann_window(400);
+        // torch.hann_window(400, periodic=True)[1] = 0.0000616908
+        println!("window[1] = {:.10}", window400[1]);
+        assert!(
+            (window400[1] - 6.1690807e-05).abs() < 1e-8,
+            "Window should match torch periodic, got {}",
+            window400[1]
+        );
     }
 
     #[test]
@@ -411,10 +442,15 @@ mod tests {
             .collect();
         let result = mel.compute_log(&samples);
         assert!(!result.is_empty());
-        // Log mel values should be in [-1, 1] range after normalization
+        // Log mel values should be roughly in [-1, 2] range after normalization
+        // (not clamped, per vLLM implementation)
         for frame in &result {
             for &val in frame {
-                assert!(val >= -1.0 && val <= 1.0, "Value out of range: {}", val);
+                assert!(
+                    val >= -2.0 && val <= 3.0,
+                    "Value out of expected range: {}",
+                    val
+                );
             }
         }
     }
@@ -444,5 +480,132 @@ mod tests {
         let mel_8000 = MelSpectrogram::hz_to_mel(8000.0);
         let hz_8000 = MelSpectrogram::mel_to_hz(mel_8000);
         assert!((hz_8000 - 8000.0).abs() < 10.0);
+    }
+
+    #[test]
+    fn test_filterbank_matches_python() {
+        use ndarray::ArrayD;
+        use ndarray_npy::ReadNpyExt;
+        use std::fs::File;
+
+        let reference_path = "test_data/mel_filterbank_reference.npy";
+        if !std::path::Path::new(reference_path).exists() {
+            println!("Skipping filterbank comparison - reference file not found");
+            return;
+        }
+
+        let file = File::open(reference_path).expect("Failed to open reference");
+        // Reference may be float64
+        let py_fb: ArrayD<f64> = ArrayD::<f64>::read_npy(file).expect("Failed to read reference");
+
+        // Python shape is [201, 128], we need [128, 201]
+        let mel = MelSpectrogram::voxtral();
+        assert_eq!(mel.mel_basis.len(), 128);
+        assert_eq!(mel.mel_basis[0].len(), 201);
+
+        let mut max_diff = 0.0f32;
+        let mut sum_diff = 0.0f64;
+        let mut count = 0usize;
+
+        for (mel_idx, filter) in mel.mel_basis.iter().enumerate() {
+            for (freq_idx, &rust_val) in filter.iter().enumerate() {
+                // Python is [freq, mel], transposed
+                let py_val = py_fb[[freq_idx, mel_idx]] as f32;
+                let diff = (rust_val - py_val).abs();
+                max_diff = max_diff.max(diff);
+                sum_diff += diff as f64;
+                count += 1;
+            }
+        }
+
+        let mean_diff = sum_diff / count as f64;
+        println!(
+            "Filterbank comparison: max_diff={:.6}, mean_diff={:.6}",
+            max_diff, mean_diff
+        );
+
+        // Our filterbank should match Python's within floating point precision
+        assert!(
+            max_diff < 1e-3,
+            "Filterbank max diff {} exceeds tolerance",
+            max_diff
+        );
+    }
+
+    #[test]
+    fn test_mel_spectrogram_matches_python() {
+        use crate::audio::{io::load_wav, pad::pad_audio, pad::PadConfig};
+        use ndarray::ArrayD;
+        use ndarray_npy::ReadNpyExt;
+        use std::fs::File;
+
+        let audio_path = "test_data/mary_had_lamb.wav";
+        let reference_path = "test_data/reference_mel_padded.npy";
+
+        if !std::path::Path::new(audio_path).exists()
+            || !std::path::Path::new(reference_path).exists()
+        {
+            println!("Skipping mel comparison - required files not found");
+            return;
+        }
+
+        // Load and pad audio
+        let audio = load_wav(audio_path).expect("Failed to load audio");
+        let pad_config = PadConfig::voxtral();
+        let padded = pad_audio(&audio, &pad_config);
+
+        // Compute mel
+        let mel = MelSpectrogram::voxtral();
+        let rust_mel = mel.compute_log(&padded.samples);
+
+        // Load Python reference (shape [128, 1992])
+        let file = File::open(reference_path).expect("Failed to open reference");
+        let py_mel: ArrayD<f32> = ArrayD::<f32>::read_npy(file).expect("Failed to read reference");
+
+        let n_frames = rust_mel.len();
+        let n_mels = if n_frames > 0 { rust_mel[0].len() } else { 0 };
+
+        println!("Rust mel shape: [{}, {}]", n_mels, n_frames);
+        println!("Python mel shape: {:?}", py_mel.shape());
+
+        // Compare (note: Rust is [frames, mels], Python is [mels, frames])
+        let mut max_diff = 0.0f32;
+        let mut sum_diff = 0.0f64;
+        let mut count = 0usize;
+        let mut max_diff_loc = (0, 0);
+
+        for (frame_idx, frame) in rust_mel.iter().enumerate() {
+            for (mel_idx, &rust_val) in frame.iter().enumerate() {
+                if frame_idx >= py_mel.shape()[1] || mel_idx >= py_mel.shape()[0] {
+                    continue;
+                }
+                let py_val = py_mel[[mel_idx, frame_idx]];
+                let diff = (rust_val - py_val).abs();
+                if diff > max_diff {
+                    max_diff = diff;
+                    max_diff_loc = (mel_idx, frame_idx);
+                }
+                sum_diff += diff as f64;
+                count += 1;
+            }
+        }
+
+        let mean_diff = sum_diff / count as f64;
+        println!(
+            "Mel comparison: max_diff={:.6} at {:?}, mean_diff={:.6}",
+            max_diff, max_diff_loc, mean_diff
+        );
+
+        // Check some specific values
+        println!("Sample values at frame 500:");
+        println!("  Rust mel[500][64] = {:.6}", rust_mel[500][64]);
+        println!("  Python mel[64, 500] = {:.6}", py_mel[[64, 500]]);
+
+        // Should match within reasonable tolerance
+        assert!(
+            max_diff < 0.01,
+            "Mel max diff {:.6} exceeds tolerance",
+            max_diff
+        );
     }
 }

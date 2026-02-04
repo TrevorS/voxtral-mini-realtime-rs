@@ -8,5 +8,6 @@ pub mod decoder;
 pub mod encoder;
 pub mod layers;
 pub mod loader;
+pub mod time_embedding;
 pub mod voxtral;
 pub mod weights;

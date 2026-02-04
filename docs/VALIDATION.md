@@ -23,48 +23,62 @@ Component-by-component validation of the Rust implementation against Python refe
 
 | Component | Status | Max Diff | Notes |
 |-----------|--------|----------|-------|
-| Hann window | 🔲 | | Compare to scipy |
-| FFT | 🔲 | | Compare to numpy/torch |
-| Mel filterbank | 🔲 | | Compare to librosa |
-| Mel spectrogram | 🔲 | | End-to-end audio → mel |
-| Log normalization | 🔲 | | Voxtral's specific norm |
+| Hann window | ✅ | < 1e-6 | Pure Rust FFT |
+| FFT | ✅ | < 1e-5 | rustfft crate |
+| Mel filterbank | ✅ | < 1e-3 | Slaney normalization |
+| Mel spectrogram | ✅ | < 1e-3 | global_log_mel_max=1.5 |
+| Log normalization | ✅ | exact | Fixed value normalization |
 
 ### Audio Encoder
 
 | Component | Status | Max Diff | Notes |
 |-----------|--------|----------|-------|
-| Conv1d layer 1 | 🔲 | | With stride=2 |
-| Conv1d layer 2 | 🔲 | | With stride=2 |
-| RMSNorm | 🔲 | | Standard variant |
-| ADA RMSNorm | 🔲 | | T-conditional variant |
-| RoPE | 🔲 | | theta=1M |
-| Causal attention | 🔲 | | With sliding window |
-| SwiGLU MLP | 🔲 | | gate * silu(up) |
-| Single layer | 🔲 | | Full layer forward |
-| 32-layer stack | 🔲 | | Full encoder |
+| Conv1d layer 1 | ✅ | < 1e-4 | 128→1280, stride=2 |
+| Conv1d layer 2 | ✅ | < 1e-4 | 1280→1280, stride=2 |
+| RMSNorm | ✅ | < 1e-5 | Standard variant |
+| ADA RMSNorm | ✅ | < 1e-4 | GELU activation (not SiLU!) |
+| RoPE | ✅ | < 1e-5 | theta=1M, interleaved layout |
+| Causal attention | ✅ | < 1e-4 | MHA with sliding window 750 |
+| SwiGLU MLP | ✅ | < 1e-4 | gate * silu(up), with biases |
+| Single layer | ✅ | < 1e-3 | Full layer forward |
+| 32-layer stack | ✅ | < 1e-2 | Matches Python reference |
 
 ### Language Model
 
 | Component | Status | Max Diff | Notes |
 |-----------|--------|----------|-------|
-| Token embedding | 🔲 | | vocab=131072 |
-| RMSNorm | 🔲 | | eps=1e-5 |
-| RoPE | 🔲 | | theta=1M, head_dim=128 |
-| GQA attention | 🔲 | | 32Q/8KV with repeat_kv |
-| Sliding window mask | 🔲 | | 8192 tokens |
-| SwiGLU MLP | 🔲 | | hidden=9216 |
-| Single layer | 🔲 | | Full layer forward |
-| 26-layer stack | 🔲 | | Full LLM |
-| LM head | 🔲 | | Tied weights |
+| Token embedding | ✅ | exact | vocab=131072, tied weights |
+| RMSNorm | ✅ | < 1e-5 | eps=1e-5 |
+| ADA RMSNorm (decoder) | ✅ | < 1e-4 | GELU, t_cond from TimeEmbedding |
+| RoPE | ✅ | < 1e-5 | theta=1M, head_dim=128 |
+| GQA attention | ✅ | < 1e-4 | 32Q/8KV with repeat_kv |
+| Sliding window mask | ✅ | exact | 8192 tokens |
+| SwiGLU MLP | ✅ | < 1e-4 | hidden=9216, no biases |
+| Single layer | ✅ | < 1e-3 | Full layer forward |
+| 26-layer stack | ✅ | < 1e-2 | Matches Python reference |
+| LM head | ✅ | exact | Tied with embeddings |
 
 ### Integration
 
 | Component | Status | Max Diff | Notes |
 |-----------|--------|----------|-------|
-| Audio reshape | 🔲 | | [T, 1280] → [T/4, 5120] |
-| Adapter projection | 🔲 | | Linear → GELU → Linear |
-| KV cache | 🔲 | | Incremental updates |
-| End-to-end | 🔲 | | Audio → tokens |
+| Audio reshape | ✅ | exact | [T, 1280] → [T/4, 5120] |
+| Adapter projection | ✅ | < 1e-4 | Linear → GELU → Linear |
+| KV cache | ✅ | exact | Concat-based, window eviction |
+| TimeEmbedding | ✅ | < 1e-5 | Sinusoidal, t=6.0 |
+| End-to-end forward | ✅ | < 1e-2 | Audio → logits |
+| **Transcription** | ✅ | **WORKING** | Python verified, Rust ready |
+
+### Streaming Inference
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Position 38 anomaly | ✅ Identified | Use prefix 38 not 39 |
+| Autoregressive loop Python | ✅ Complete | Verified correct transcription |
+| Autoregressive loop Rust | ✅ Complete | Output matches Python exactly |
+| Tokenizer decoding | ✅ Fixed | Text tokens offset by 1000 from vocab indices |
+| Left-pad audio alignment | ✅ Complete | `scripts/generate_padded_reference.py` |
+| KV cache streaming | 🔲 Pending | Future optimization work |
 
 ## Test Data Requirements
 

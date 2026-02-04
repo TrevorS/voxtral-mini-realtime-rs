@@ -55,6 +55,7 @@ def main():
     n_fft = 400
 
     # Simple mel spectrogram using torch
+    # IMPORTANT: Must match vLLM/mistral-common parameters!
     import torchaudio.transforms as T
 
     audio_tensor = torch.from_numpy(audio).float()
@@ -64,6 +65,10 @@ def main():
         win_length=n_fft,
         hop_length=hop_length,
         n_mels=n_mels,
+        f_min=0.0,
+        f_max=8000.0,  # Voxtral uses 8000 Hz max
+        mel_scale='slaney',  # Must match mistral-common
+        norm='slaney',  # Must match mistral-common
     )
     mel = mel_transform(audio_tensor)
 
@@ -71,10 +76,12 @@ def main():
     print(f"  Raw mel stats: min={mel.min():.6f}, max={mel.max():.6f}, mean={mel.mean():.6f}")
     print(f"  Raw mel [0, 100:105]: {mel[0, 100:105].tolist()}")
 
-    # Log scale (Whisper-style)
+    # Log scale (Voxtral-style with global_log_mel_max=1.5)
+    global_log_mel_max = 1.5  # From params.json
     mel = torch.clamp(mel, min=1e-10).log10()
     print(f"  After log10: min={mel.min():.4f}, max={mel.max():.4f}")
-    mel = torch.maximum(mel, mel.max() - 8.0)
+    # Use global max instead of per-audio max
+    mel = torch.maximum(mel, torch.tensor(global_log_mel_max) - 8.0)
     mel = (mel + 4.0) / 4.0
 
     print(f"  Normalized mel shape: {mel.shape}")

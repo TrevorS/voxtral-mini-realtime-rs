@@ -48,14 +48,22 @@ struct TekkenJson {
 ///
 /// This implements decoding only - for ASR we receive token IDs from
 /// the model and decode them to text.
+///
+/// Note: Text token IDs are offset by 1000 from the vocab index.
+/// Token ID 1000+ maps to vocab index (token_id - 1000).
+/// Token IDs 0-999 are reserved for special/control tokens.
 pub struct VoxtralTokenizer {
-    /// Token ID -> decoded bytes
-    id_to_bytes: HashMap<u32, Vec<u8>>,
-    /// Token ID -> string representation (for special tokens)
-    id_to_str: HashMap<u32, String>,
+    /// Vocab index -> decoded bytes (for text tokens)
+    /// Token ID = vocab_index + 1000 for text tokens
+    vocab_bytes: Vec<Option<Vec<u8>>>,
+    /// Special token ID -> string representation (token IDs 0-999)
+    special_tokens: HashMap<u32, String>,
     /// Vocabulary size
     vocab_size: usize,
 }
+
+/// Offset for text tokens. Token ID 1000 = vocab index 0.
+const TEXT_TOKEN_OFFSET: u32 = 1000;
 
 impl VoxtralTokenizer {
     /// Load tokenizer from a `tekken.json` file.
@@ -69,16 +77,17 @@ impl VoxtralTokenizer {
             .with_context(|| format!("Failed to parse tekken.json: {}", path.display()))?;
 
         let vocab_size = tekken.config.default_vocab_size;
-        let mut id_to_bytes = HashMap::with_capacity(tekken.vocab.len());
-        let mut id_to_str = HashMap::with_capacity(tekken.vocab.len());
 
-        for entry in tekken.vocab {
-            let id = entry.rank;
+        // Pre-allocate vocab_bytes indexed by vocab position
+        let mut vocab_bytes: Vec<Option<Vec<u8>>> = vec![None; tekken.vocab.len()];
+        let mut special_tokens = HashMap::new();
 
-            // For control/special tokens, just store the string representation
+        for (idx, entry) in tekken.vocab.iter().enumerate() {
+            // For control/special tokens, store separately
             if entry.is_control {
                 if let Some(s) = &entry.token_str {
-                    id_to_str.insert(id, s.clone());
+                    // Special tokens use their rank directly as token ID (0-999 range)
+                    special_tokens.insert(entry.rank, s.clone());
                 }
                 continue;
             }
@@ -86,20 +95,20 @@ impl VoxtralTokenizer {
             // Decode token bytes from base64 if present
             if let Some(b64) = &entry.token_bytes {
                 if let Ok(bytes) = BASE64_STANDARD.decode(b64) {
-                    id_to_bytes.insert(id, bytes);
+                    vocab_bytes[idx] = Some(bytes);
                     continue;
                 }
             }
 
             // Fall back to UTF-8 encoding of token_str if present
             if let Some(s) = &entry.token_str {
-                id_to_bytes.insert(id, s.as_bytes().to_vec());
+                vocab_bytes[idx] = Some(s.as_bytes().to_vec());
             }
         }
 
         Ok(Self {
-            id_to_bytes,
-            id_to_str,
+            vocab_bytes,
+            special_tokens,
             vocab_size,
         })
     }
@@ -112,19 +121,23 @@ impl VoxtralTokenizer {
 
     /// Decode token IDs to text.
     ///
-    /// Concatenates the bytes for each token and decodes as UTF-8.
-    /// Special/control tokens are skipped.
+    /// Token IDs >= 1000 are text tokens (vocab_index = token_id - 1000).
+    /// Token IDs < 1000 are special/control tokens and are skipped.
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         let mut bytes = Vec::new();
 
         for &id in ids {
-            // Skip special/control tokens
-            if self.id_to_str.contains_key(&id) {
+            // Special/control tokens (0-999) are skipped
+            if id < TEXT_TOKEN_OFFSET {
                 continue;
             }
 
-            if let Some(token_bytes) = self.id_to_bytes.get(&id) {
-                bytes.extend_from_slice(token_bytes);
+            // Text tokens: vocab_index = token_id - 1000
+            let vocab_idx = (id - TEXT_TOKEN_OFFSET) as usize;
+            if vocab_idx < self.vocab_bytes.len() {
+                if let Some(token_bytes) = &self.vocab_bytes[vocab_idx] {
+                    bytes.extend_from_slice(token_bytes);
+                }
             }
             // Unknown tokens are silently skipped
         }
@@ -135,11 +148,17 @@ impl VoxtralTokenizer {
 
     /// Decode a single token ID to its string representation.
     pub fn decode_token(&self, id: u32) -> Option<String> {
-        if let Some(s) = self.id_to_str.get(&id) {
-            return Some(s.clone());
+        // Special tokens (0-999)
+        if id < TEXT_TOKEN_OFFSET {
+            return self.special_tokens.get(&id).cloned();
         }
-        if let Some(bytes) = self.id_to_bytes.get(&id) {
-            return Some(String::from_utf8_lossy(bytes).into_owned());
+
+        // Text tokens: vocab_index = token_id - 1000
+        let vocab_idx = (id - TEXT_TOKEN_OFFSET) as usize;
+        if vocab_idx < self.vocab_bytes.len() {
+            if let Some(bytes) = &self.vocab_bytes[vocab_idx] {
+                return Some(String::from_utf8_lossy(bytes).into_owned());
+            }
         }
         None
     }
@@ -169,9 +188,11 @@ mod tests {
 
         let tokenizer = VoxtralTokenizer::from_file(&path).unwrap();
         assert_eq!(tokenizer.vocab_size(), 131072);
+        let vocab_count = tokenizer.vocab_bytes.iter().filter(|v| v.is_some()).count();
         println!(
-            "Loaded tokenizer with {} vocab entries",
-            tokenizer.id_to_bytes.len() + tokenizer.id_to_str.len()
+            "Loaded tokenizer with {} text vocab entries, {} special tokens",
+            vocab_count,
+            tokenizer.special_tokens.len()
         );
     }
 
@@ -185,13 +206,21 @@ mod tests {
 
         let tokenizer = VoxtralTokenizer::from_file(&path).unwrap();
 
-        // Token 72 should be "H", token 101 should be "e", etc.
-        // Let's check what some common ASCII tokens decode to
-        for id in 65..=90 {
-            // A-Z in ASCII
+        // Text tokens are offset by 1000
+        // Token 1362 should be " I", token 1294 should be " in", etc.
+        let test_tokens = [1362_u32, 19135, 1294, 1278, 4618, 40307, 3910, 1046];
+        let expected = " I spoke in the original phonograph.";
+
+        // Test individual tokens
+        for &id in &test_tokens {
             if let Some(s) = tokenizer.decode_token(id) {
                 println!("Token {}: {:?}", id, s);
             }
         }
+
+        // Test full decode
+        let decoded = tokenizer.decode(&test_tokens).unwrap();
+        println!("Full decode: {:?}", decoded);
+        assert_eq!(decoded, expected);
     }
 }

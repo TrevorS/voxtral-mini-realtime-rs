@@ -59,6 +59,9 @@ impl VoxtralModelLoader {
 
     /// Load the audio encoder with pretrained weights.
     fn load_encoder<B: Backend>(&self, device: &B::Device) -> Result<AudioEncoder<B>> {
+        use super::layers::RmsNorm;
+        use super::weights::prefixes;
+
         let config = AudioEncoderConfig::voxtral();
 
         // Load conv downsampler
@@ -76,7 +79,17 @@ impl VoxtralModelLoader {
             layers.push(layer);
         }
 
-        Ok(AudioEncoder::new(conv, rope, layers))
+        // Load final layer norm
+        let norm_weight_name = format!("{}.transformer.norm.weight", prefixes::ENCODER);
+        let norm_weight: Tensor<B, 1> = load_tensor(&self.safetensors, &norm_weight_name, device)?;
+        let norm = RmsNorm {
+            weight: burn::nn::RmsNorm {
+                gamma: Param::initialized(ParamId::new(), norm_weight),
+                epsilon: config.norm_eps,
+            },
+        };
+
+        Ok(AudioEncoder::new(conv, rope, layers, norm))
     }
 
     /// Load the conv downsampler with pretrained weights.

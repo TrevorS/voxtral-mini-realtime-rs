@@ -181,6 +181,17 @@ impl<B: Backend> LanguageModel<B> {
         self.norm.forward(x)
     }
 
+    /// Get token embeddings (for adding to audio embeddings in multimodal mode).
+    ///
+    /// # Arguments
+    /// * `token_ids` - Token IDs [batch, seq]
+    ///
+    /// # Returns
+    /// Token embeddings [batch, seq, d_model]
+    pub fn embed_tokens(&self, token_ids: Tensor<B, 2, burn::tensor::Int>) -> Tensor<B, 3> {
+        self.tok_embeddings.forward(token_ids)
+    }
+
     /// Forward pass with hidden states input (for multimodal).
     ///
     /// # Arguments

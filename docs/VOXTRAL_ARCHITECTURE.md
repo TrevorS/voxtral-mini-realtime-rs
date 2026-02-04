@@ -454,14 +454,129 @@ For GPU inference with BF16:
 
 ---
 
+## Critical Corrections (Feb 2026)
+
+### ADA RMSNorm Location
+
+**CORRECTION:** ADA RMSNorm is used in the **decoder (LLM)**, NOT the encoder.
+
+The encoder uses standard RMSNorm. The decoder uses ADA RMSNorm with t-conditioning:
+- `layers.{N}.ada_rms_norm_t_cond.0.weight` - [32, 3072]
+- `layers.{N}.ada_rms_norm_t_cond.2.weight` - [3072, 32]
+
+The ADA conditioning uses **GELU activation** (not SiLU):
+```python
+scale = linear_2(gelu(linear_0(t_embed)))  # NOT linear_2(silu(linear_0(t_embed)))
+x_scaled = x_normalized * (1 + scale)
+```
+
+### Time Embedding (t_cond)
+
+The t_embed is computed using sinusoidal time embedding with `t = num_delay_tokens = 6`:
+```python
+def time_embedding(t, dim=3072, theta=10000.0):
+    half_dim = dim // 2
+    inv_freq = exp(-log(theta) * arange(half_dim) / half_dim)
+    emb = t * inv_freq
+    return concat([cos(emb), sin(emb)])
+
+t_embed = time_embedding(torch.tensor([6.0]))  # [1, 3072]
+```
+
+---
+
+## Streaming Inference (Critical)
+
+### Position 38 Anomaly
+
+**WARNING:** The standard prefix length of 39 tokens (BOS + 38 `[STREAMING_PAD]`) causes anomalous behavior at position 38.
+
+When position 38 is the **last** position in the prefix:
+- Hidden state norm diverges: Layer 25 shows pos 38 norm=452 vs pos 36/37 norm=1000-1100
+- All logits become very negative (-17 to -55 range)
+- Always predicts `[STREAMING_PAD]` regardless of audio content
+
+**Root cause:** Position 38 = n_left_pad_tokens(32) + num_delay_tokens(6) is exactly at the trained prefix boundary.
+
+### Working Solution
+
+Use **prefix length 38** (one less than standard) for generation:
+```python
+prefix_tokens = [1] + [32] * 37  # BOS + 37 STREAMING_PAD = 38 tokens
+```
+
+With prefix 38, position 37 correctly predicts `[STREAMING_WORD]` (token 33), enabling proper transcription.
+
+### Verified Transcription Output
+
+Test audio: `test_data/mary_had_lamb.wav` (15.95s)
+- Expected: "First words I spoke in the original phonograph..."
+- Produced: " I spoke in the original phonograph. A little piece of practical poetry"
+
+(Missing "First words" is expected - position 38 corresponds to ~2.1s into the speech)
+
+### Token Semantics
+
+| Token ID | Name | Meaning |
+|----------|------|---------|
+| 1 | `<s>` / BOS | Beginning of sequence |
+| 32 | `[STREAMING_PAD]` | Silence / pause between words |
+| 33 | `[STREAMING_WORD]` | Start of a word (next tokens will be text) |
+| ≥1000 | Text tokens | Actual transcription content |
+
+### Tokenizer Offset (Critical!)
+
+**Text token IDs are offset by 1000 from vocab indices in tekken.json.**
+
+```
+Token ID 1000 → vocab index 0
+Token ID 1362 → vocab index 362 (" I")
+Token ID 19135 → vocab index 18135 (" spoke")
+```
+
+When decoding text tokens, subtract 1000 to get the vocab index:
+```rust
+let vocab_idx = (token_id - 1000) as usize;
+let bytes = vocab_bytes[vocab_idx];
+```
+
+Token IDs 0-999 are reserved for special/control tokens (BOS, STREAMING_PAD, etc.).
+
+### Autoregressive Generation Pattern
+
+```python
+# 1. Process prefix (38 positions)
+prefix = [BOS] + [STREAMING_PAD] * 37
+audio_slice = audio_embeds[:, :38, :]
+logits = model.forward(audio_slice, prefix_embeds, t_embed)
+next_token = logits[:, -1, :].argmax()  # Position 37 predicts position 38
+
+# 2. Autoregressive loop
+for pos in range(38, seq_len):
+    prev_token_embed = embed(generated_tokens[-1])
+    audio_at_pos = audio_embeds[:, pos-1:pos, :]
+    input = prev_token_embed + audio_at_pos
+    logits = model.forward_step(input, cache)
+    next_token = logits.argmax()
+    generated_tokens.append(next_token)
+
+# 3. Decode (filter control tokens)
+text_tokens = [t for t in generated_tokens if t >= 1000]
+text = tokenizer.decode(text_tokens)
+```
+
+---
+
 ## Summary
 
 | Component | Layers | Dim | Heads | Window | Special |
 |-----------|--------|-----|-------|--------|---------|
-| Audio Encoder | 32 | 1280 | 32 MHA | 750 | Causal, ADA RMSNorm, biases |
-| Language Model | 26 | 3072 | 32Q/8KV | 8192 | GQA 4:1, no biases, tied embed |
+| Audio Encoder | 32 | 1280 | 32 MHA | 750 | Causal, standard RMSNorm, biases |
+| Language Model | 26 | 3072 | 32Q/8KV | 8192 | GQA 4:1, ADA RMSNorm, no biases, tied embed |
 | Adapter | 2 | 5120→3072 | - | - | GELU activation |
 
 **Key insight:** The causal attention throughout the audio encoder is what enables true real-time streaming ASR. Standard Whisper cannot stream because it uses bidirectional attention.
 
 **Timing:** 1 text token = 80ms audio = 1280 samples @ 16kHz
+
+**Critical:** Use prefix length 38 (not 39) to avoid position 38 anomaly.

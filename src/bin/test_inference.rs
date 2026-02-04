@@ -1,31 +1,36 @@
 //! Test inference with pretrained Voxtral model.
 //!
 //! Loads an audio file, extracts mel spectrogram, runs through the model,
-//! and decodes the output to text.
+//! and decodes the output to text. Fully Rust-native audio pipeline.
 
 use burn::backend::Wgpu;
+use burn::prelude::ElementConversion;
 use burn::tensor::Tensor;
 use voxtral_mini_realtime::audio::{
     io::load_wav,
     mel::{MelConfig, MelSpectrogram},
+    pad::{pad_audio, PadConfig},
     resample::resample_to_16k,
 };
 use voxtral_mini_realtime::models::loader::VoxtralModelLoader;
+use voxtral_mini_realtime::models::time_embedding::TimeEmbedding;
 use voxtral_mini_realtime::tokenizer::VoxtralTokenizer;
 
 type TestBackend = Wgpu;
 
 fn main() {
-    // Check arguments
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <audio.wav>", args[0]);
+        eprintln!("Usage: {} <audio.wav> [--use-python-embeds]", args[0]);
         eprintln!();
         eprintln!("Example: {} test.wav", args[0]);
+        eprintln!("         {} test.wav --use-python-embeds", args[0]);
         std::process::exit(1);
     }
 
     let audio_path = &args[1];
+    let use_python_embeds = args.iter().any(|a| a == "--use-python-embeds");
+    let use_python_mel = args.iter().any(|a| a == "--use-python-mel");
     let model_path = "models/voxtral/consolidated.safetensors";
     let tokenizer_path = "models/voxtral/tekken.json";
 
@@ -46,214 +51,179 @@ fn main() {
     // Load tokenizer
     println!("Loading tokenizer...");
     let tokenizer = VoxtralTokenizer::from_file(tokenizer_path).expect("Failed to load tokenizer");
-    println!("  Vocab size: {}", tokenizer.vocab_size());
 
-    // Load audio
-    println!("\nLoading audio from {}...", audio_path);
-    let audio = load_wav(audio_path).expect("Failed to load audio");
-    println!("  Sample rate: {} Hz", audio.sample_rate);
-    println!("  Duration: {:.2}s", audio.duration_secs());
-    println!("  Samples: {}", audio.samples.len());
+    // Load model
+    println!("Loading model...");
+    let loader = VoxtralModelLoader::from_file(model_path).expect("Failed to create model loader");
+    let model = loader
+        .load::<TestBackend>(&device)
+        .expect("Failed to load model");
 
-    // Resample to 16kHz if needed
-    let audio = if audio.sample_rate != 16000 {
-        println!("  Resampling to 16kHz...");
-        resample_to_16k(&audio).expect("Failed to resample audio")
-    } else {
-        audio
-    };
-    let samples = &audio.samples;
-    println!("  Samples after resampling: {}", samples.len());
+    // Prepare time embedding (t=6 for 480ms delay at 12.5 Hz frame rate)
+    let time_embed = TimeEmbedding::new(3072);
+    let t_embed = time_embed.embed::<TestBackend>(6.0, &device);
 
-    // Try to load reference mel from Python if available
-    let mel_tensor: Tensor<TestBackend, 3> = if std::path::Path::new("test_data/reference_mel.npy")
-        .exists()
-    {
-        println!("\nLoading reference mel from Python...");
+    // Get audio embeddings
+    let audio_embeds: Tensor<TestBackend, 3> = if use_python_embeds {
+        // Use pre-computed embeddings from Python for validation
+        println!("Loading pre-computed audio embeddings from Python...");
         use ndarray::ArrayD;
         use ndarray_npy::ReadNpyExt;
         use std::fs::File;
 
-        let file = File::open("test_data/reference_mel.npy").expect("Failed to open npy file");
+        let file = File::open("test_data/reference_audio_embeds_padded.npy")
+            .expect("Failed to open npy file");
+        let embeds_arr: ArrayD<f32> =
+            ArrayD::<f32>::read_npy(file).expect("Failed to read npy file");
+        let shape = embeds_arr.shape();
+        let seq_len = shape[0];
+        let dim = shape[1];
+        println!("  Shape: [1, {}, {}]", seq_len, dim);
+
+        let embeds_flat: Vec<f32> = embeds_arr.iter().cloned().collect();
+        Tensor::from_data(
+            burn::tensor::TensorData::new(embeds_flat, [1, seq_len, dim]),
+            &device,
+        )
+    } else if use_python_mel {
+        // Use Python mel with Rust encoder (for debugging)
+        println!("Loading mel spectrogram from Python...");
+        use ndarray::ArrayD;
+        use ndarray_npy::ReadNpyExt;
+        use std::fs::File;
+
+        let file =
+            File::open("test_data/reference_mel_padded.npy").expect("Failed to open npy file");
         let mel_arr: ArrayD<f32> = ArrayD::<f32>::read_npy(file).expect("Failed to read npy file");
         let shape = mel_arr.shape();
         let n_mels = shape[0];
         let n_frames = shape[1];
-        println!("  Reference mel shape: [{}, {}]", n_mels, n_frames);
+        println!("  Python mel shape: [{}, {}]", n_mels, n_frames);
+
+        // Stats for comparison
+        let min_val = mel_arr.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = mel_arr.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mean_val: f32 = mel_arr.iter().sum::<f32>() / mel_arr.len() as f32;
+        println!(
+            "  Range: [{:.4}, {:.4}], mean: {:.4}",
+            min_val, max_val, mean_val
+        );
 
         let mel_flat: Vec<f32> = mel_arr.iter().cloned().collect();
-        Tensor::from_data(
+        let mel_tensor: Tensor<TestBackend, 3> = Tensor::from_data(
             burn::tensor::TensorData::new(mel_flat, [1, n_mels, n_frames]),
             &device,
-        )
+        );
+
+        println!("Running Rust encoder with Python mel...");
+        model.encode_audio(mel_tensor)
     } else {
-        // Fall back to Rust mel computation
-        println!("\nExtracting mel spectrogram (Rust)...");
+        // Pure Rust pipeline
+        println!("Loading audio from {}...", audio_path);
+        let audio = load_wav(audio_path).expect("Failed to load audio");
+        println!(
+            "  Original duration: {:.2}s ({} samples)",
+            audio.duration_secs(),
+            audio.samples.len()
+        );
+
+        let audio = if audio.sample_rate != 16000 {
+            println!("  Resampling to 16kHz...");
+            resample_to_16k(&audio).expect("Failed to resample audio")
+        } else {
+            audio
+        };
+
+        // Apply left-padding for streaming alignment
+        let pad_config = PadConfig::voxtral();
+        println!(
+            "  Left-padding with {} samples ({} tokens)",
+            pad_config.left_pad_samples(),
+            pad_config.n_left_pad_tokens
+        );
+        let padded_audio = pad_audio(&audio, &pad_config);
+        println!(
+            "  Padded duration: {:.2}s ({} samples)",
+            padded_audio.duration_secs(),
+            padded_audio.samples.len()
+        );
+
+        // Extract mel spectrogram
+        println!("Extracting mel spectrogram...");
         let mel_config = MelConfig::voxtral();
         let mel_extractor = MelSpectrogram::new(mel_config);
-        let mel = mel_extractor.compute_log(samples);
+        let mel = mel_extractor.compute_log(&padded_audio.samples);
         let n_frames = mel.len();
         let n_mels = if n_frames > 0 { mel[0].len() } else { 0 };
-        println!("  Mel shape: [frames={}, mels={}]", n_frames, n_mels);
+        println!("  Rust mel shape: [{}, {}]", n_mels, n_frames);
 
-        // Transpose from [n_frames, n_mels] to [n_mels, n_frames]
+        // Stats for comparison
+        let mut min_val = f32::INFINITY;
+        let mut max_val = f32::NEG_INFINITY;
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for frame in &mel {
+            for &val in frame {
+                if val < min_val {
+                    min_val = val;
+                }
+                if val > max_val {
+                    max_val = val;
+                }
+                sum += val as f64;
+                count += 1;
+            }
+        }
+        let mean_val = sum / count as f64;
+        println!(
+            "  Range: [{:.4}, {:.4}], mean: {:.4}",
+            min_val, max_val, mean_val
+        );
+
+        // Transpose to [n_mels, n_frames] and create tensor
         let mut mel_transposed = vec![vec![0.0f32; n_frames]; n_mels];
         for (frame_idx, frame) in mel.iter().enumerate() {
             for (mel_idx, &val) in frame.iter().enumerate() {
                 mel_transposed[mel_idx][frame_idx] = val;
             }
         }
-
         let mel_flat: Vec<f32> = mel_transposed.into_iter().flatten().collect();
-        Tensor::from_data(
+        let mel_tensor: Tensor<TestBackend, 3> = Tensor::from_data(
             burn::tensor::TensorData::new(mel_flat, [1, n_mels, n_frames]),
             &device,
-        )
+        );
+
+        // Run encoder
+        println!("Running encoder...");
+        model.encode_audio(mel_tensor)
     };
-    let n_frames = mel_tensor.dims()[2];
-    println!("  Mel tensor shape: {:?}", mel_tensor.dims());
 
-    // Load model
-    println!("\nLoading model (this may take a few minutes)...");
-    let loader = VoxtralModelLoader::from_file(model_path).expect("Failed to create model loader");
-    let model = loader
-        .load::<TestBackend>(&device)
-        .expect("Failed to load model");
+    println!("  Audio sequence length: {}", audio_embeds.dims()[1]);
 
-    // Debug: check mel input
-    println!("\nDebug: checking mel input...");
-    let mel_data = mel_tensor.clone().to_data();
-    let mel_slice = mel_data.as_slice::<f32>().unwrap();
-    let mel_min = mel_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-    let mel_max = mel_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mel_mean: f32 = mel_slice.iter().sum::<f32>() / mel_slice.len() as f32;
+    // Run streaming transcription
+    println!("\nRunning transcription...");
+    let generated_tokens = transcribe_with_audio_embeds(&model, audio_embeds, t_embed, &device);
+
+    // Show token distribution
+    let streaming_pad_count = generated_tokens.iter().filter(|&&t| t == 32).count();
+    let streaming_word_count = generated_tokens.iter().filter(|&&t| t == 33).count();
+    let text_token_count = generated_tokens.iter().filter(|&&t| t >= 1000).count();
     println!(
-        "  Mel stats: min={:.4}, max={:.4}, mean={:.4}",
-        mel_min, mel_max, mel_mean
-    );
-    println!(
-        "  First few mel values: {:?}",
-        &mel_slice[..10.min(mel_slice.len())]
+        "  Generated {} tokens: {} pad, {} word markers, {} text",
+        generated_tokens.len(),
+        streaming_pad_count,
+        streaming_word_count,
+        text_token_count
     );
 
-    // Compare with zeros input
-    println!("\nDebug: testing with zeros input...");
-    let zeros_mel: Tensor<TestBackend, 3> = Tensor::zeros([1, 128, n_frames], &device);
-    let zeros_hidden = model.encode_audio(zeros_mel.clone());
-    let zh_data = zeros_hidden.to_data();
-    let zh_slice = zh_data.as_slice::<f32>().unwrap();
-    println!(
-        "  Zeros hidden first 5: {:?}",
-        &zh_slice[..5.min(zh_slice.len())]
-    );
-
-    // Debug: check encoder output
-    println!("\nDebug: checking encoder output...");
-    let audio_hidden = model.encode_audio(mel_tensor.clone());
-    let ah_data = audio_hidden.clone().to_data();
-    let ah_slice = ah_data.as_slice::<f32>().unwrap();
-    let ah_min = ah_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-    let ah_max = ah_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let ah_mean: f32 = ah_slice.iter().sum::<f32>() / ah_slice.len() as f32;
-    println!("  Audio hidden shape: {:?}", audio_hidden.dims());
-    println!(
-        "  Audio hidden stats: min={:.4}, max={:.4}, mean={:.4}",
-        ah_min, ah_max, ah_mean
-    );
-    println!(
-        "  First few values: {:?}",
-        &ah_slice[..10.min(ah_slice.len())]
-    );
-
-    // Try different t_embed values
-    // The ADA RMSNorm formula is: (1 + scale) * rms_norm(x)
-    // where scale = W2(SiLU(W0(t_embed)))
-    // If t_embed is zeros, scale becomes ~0, so output = rms_norm(x)
-    // If t_embed has values, it modulates the normalization
-    // Let's try zeros first (simplest case)
-    let t_embed: Tensor<TestBackend, 3> = Tensor::zeros([1, 1, 3072], &device);
-    println!("\nDebug: Using zeros for t_embed");
-    let te_data = t_embed.clone().to_data();
-    let te_slice = te_data.as_slice::<f32>().unwrap();
-    println!(
-        "  t_embed first 5: {:?}",
-        &te_slice[..5.min(te_slice.len())]
-    );
-
-    // Run inference
-    println!("\nRunning inference...");
-    let logits = model.forward(mel_tensor, t_embed);
-    println!("  Logits shape: {:?}", logits.dims());
-
-    // Debug: print logits stats
-    let logits_data = logits.clone().to_data();
-    let logits_slice = logits_data.as_slice::<f32>().unwrap();
-    let min_val = logits_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max_val = logits_slice
+    // Filter out control tokens and decode text
+    let text_tokens: Vec<u32> = generated_tokens
         .iter()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mean_val: f32 = logits_slice.iter().sum::<f32>() / logits_slice.len() as f32;
-    println!(
-        "  Logits stats: min={:.4}, max={:.4}, mean={:.4}",
-        min_val, max_val, mean_val
-    );
+        .filter(|&&t| t >= 1000)
+        .map(|&t| t as u32)
+        .collect();
 
-    // Print first few logits for first position
-    println!(
-        "  First position logits (first 10): {:?}",
-        &logits_slice[..10]
-    );
-
-    // Find the actual argmax for first position
-    let vocab_size = 131072;
-    let first_pos_logits = &logits_slice[..vocab_size];
-    let (max_idx, max_val) = first_pos_logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .unwrap();
-    println!(
-        "  Position 0 argmax: token {} with logit {:.4}",
-        max_idx, max_val
-    );
-
-    // Show top 5 tokens for first position
-    let mut indexed: Vec<(usize, f32)> = first_pos_logits.iter().cloned().enumerate().collect();
-    indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap());
-    println!("  Top 5 tokens at position 0:");
-    for (idx, val) in indexed.iter().take(5) {
-        println!("    token {}: logit {:.4}", idx, val);
-    }
-
-    // Also check position 10 if we have enough tokens
-    let actual_seq_len = logits_slice.len() / vocab_size;
-    if actual_seq_len > 10 {
-        let pos10_logits = &logits_slice[10 * vocab_size..(10 + 1) * vocab_size];
-        let mut indexed10: Vec<(usize, f32)> = pos10_logits.iter().cloned().enumerate().collect();
-        indexed10.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap());
-        println!("  Top 5 tokens at position 10:");
-        for (idx, val) in indexed10.iter().take(5) {
-            println!("    token {}: logit {:.4}", idx, val);
-        }
-    }
-
-    // Get argmax predictions
-    let [_batch, seq_len, _vocab] = logits.dims();
-    let predictions = logits.argmax(2); // [batch, seq]
-    let pred_data = predictions.to_data();
-    let pred_slice = pred_data.as_slice::<i32>().unwrap();
-
-    println!("  Predicted {} tokens", seq_len);
-
-    // Decode tokens
-    let token_ids: Vec<u32> = pred_slice.iter().map(|&x| x as u32).collect();
-    println!(
-        "\nToken IDs (first 20): {:?}",
-        &token_ids[..token_ids.len().min(20)]
-    );
-
-    match tokenizer.decode(&token_ids) {
+    match tokenizer.decode(&text_tokens) {
         Ok(text) => {
             println!("\n=== Transcription ===");
             println!("{}", text);
@@ -263,4 +233,111 @@ fn main() {
             eprintln!("\nFailed to decode tokens: {}", e);
         }
     }
+}
+
+/// Transcribe using pre-computed audio embeddings with KV cache optimization.
+///
+/// Uses KV cache for O(n) inference instead of O(n²) recomputation.
+/// Uses prefix length 38 (not 39) to avoid position 38 anomaly.
+fn transcribe_with_audio_embeds<B: burn::tensor::backend::Backend>(
+    model: &voxtral_mini_realtime::models::voxtral::VoxtralModel<B>,
+    audio_embeds: Tensor<B, 3>,
+    t_embed: Tensor<B, 3>,
+    device: &B::Device,
+) -> Vec<i32> {
+    use burn::tensor::Int;
+
+    let seq_len = audio_embeds.dims()[1];
+    let d_model = audio_embeds.dims()[2];
+
+    // Use prefix length 38 (not 39!) to avoid position 38 anomaly
+    const PREFIX_LEN: usize = 38;
+
+    // Check if audio is long enough for streaming inference
+    if seq_len < PREFIX_LEN {
+        eprintln!(
+            "Warning: Audio too short ({} positions, need at least {}). \
+             Returning empty transcription.",
+            seq_len, PREFIX_LEN
+        );
+        return Vec::new();
+    }
+    const BOS_TOKEN: i32 = 1;
+    const STREAMING_PAD: i32 = 32;
+
+    // Create KV cache for the decoder
+    let mut decoder_cache = model.create_decoder_cache();
+
+    // Build prefix: BOS + 37 STREAMING_PAD = 38 tokens
+    let mut prefix: Vec<i32> = vec![BOS_TOKEN];
+    prefix.extend(std::iter::repeat_n(STREAMING_PAD, PREFIX_LEN - 1));
+
+    // Embed prefix tokens
+    let prefix_tensor = Tensor::<B, 2, Int>::from_data(
+        burn::tensor::TensorData::new(prefix.clone(), [1, PREFIX_LEN]),
+        device,
+    );
+    let prefix_text_embeds = model.decoder().embed_tokens(prefix_tensor);
+
+    // Slice audio embeddings for prefix positions
+    let prefix_audio = audio_embeds
+        .clone()
+        .slice([0..1, 0..PREFIX_LEN, 0..d_model]);
+
+    // Combine for prefix
+    let prefix_inputs = prefix_audio + prefix_text_embeds;
+
+    // Run forward for prefix (fills cache with 38 positions)
+    let hidden = model.decoder().forward_hidden_with_cache(
+        prefix_inputs,
+        t_embed.clone(),
+        &mut decoder_cache,
+    );
+    let logits = model.decoder().lm_head(hidden);
+
+    // Get prediction at last prefix position (37) - this predicts token 38
+    let vocab_size = logits.dims()[2];
+    let last_logits = logits
+        .clone()
+        .slice([0..1, (PREFIX_LEN - 1)..PREFIX_LEN, 0..vocab_size]);
+    let first_pred = last_logits.argmax(2);
+    let first_token: i32 = first_pred.into_scalar().elem();
+
+    let mut generated = prefix.clone();
+    generated.push(first_token);
+
+    // Autoregressive generation with KV cache (O(n) instead of O(n²))
+    for pos in PREFIX_LEN + 1..seq_len {
+        // Only embed the SINGLE new token (not all previous tokens)
+        let new_token = generated[pos - 1];
+        let token_tensor = Tensor::<B, 2, Int>::from_data(
+            burn::tensor::TensorData::new(vec![new_token], [1, 1]),
+            device,
+        );
+        let text_embed = model.decoder().embed_tokens(token_tensor);
+
+        // Only slice the SINGLE new audio position (not all previous positions)
+        let audio_pos = audio_embeds
+            .clone()
+            .slice([0..1, (pos - 1)..pos, 0..d_model]);
+
+        // Combine single position
+        let input = audio_pos + text_embed;
+
+        // Forward with cache - only processes 1 token, reuses cached KV
+        let hidden =
+            model
+                .decoder()
+                .forward_hidden_with_cache(input, t_embed.clone(), &mut decoder_cache);
+        let logits = model.decoder().lm_head(hidden);
+
+        // Logits has shape [1, 1, vocab] - take the single prediction
+        let pred = logits.argmax(2);
+        let next_token: i32 = pred.into_scalar().elem();
+
+        generated.push(next_token);
+    }
+
+    // Return generated tokens (skip prefix)
+    generated.into_iter().skip(PREFIX_LEN).collect()
 }

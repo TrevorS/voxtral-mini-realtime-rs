@@ -8,8 +8,8 @@ use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 
 use super::layers::{
-    ConvDownsampler, ConvDownsamplerConfig, EncoderLayer, EncoderLayerConfig, LayerCaches, RoPE,
-    RoPEConfig,
+    ConvDownsampler, ConvDownsamplerConfig, EncoderLayer, EncoderLayerConfig, LayerCaches, RmsNorm,
+    RmsNormConfig, RoPE, RoPEConfig,
 };
 
 /// Audio encoder configuration.
@@ -67,6 +67,7 @@ impl AudioEncoderConfig {
 ///    - Causal self-attention with sliding window (750)
 ///    - Standard RMSNorm
 ///    - SwiGLU MLP
+/// 3. Final layer norm
 ///
 /// Input: Mel spectrogram [batch, n_mels, time]
 /// Output: Hidden states [batch, time/4, d_model]
@@ -78,6 +79,8 @@ pub struct AudioEncoder<B: Backend> {
     rope: RoPE<B>,
     /// Transformer layers.
     layers: Vec<EncoderLayer<B>>,
+    /// Final layer normalization.
+    norm: RmsNorm<B>,
 }
 
 impl AudioEncoderConfig {
@@ -103,14 +106,33 @@ impl AudioEncoderConfig {
             })
             .collect();
 
-        AudioEncoder { conv, rope, layers }
+        let norm = RmsNormConfig::new(self.d_model)
+            .with_eps(self.norm_eps)
+            .init(device);
+
+        AudioEncoder {
+            conv,
+            rope,
+            layers,
+            norm,
+        }
     }
 }
 
 impl<B: Backend> AudioEncoder<B> {
     /// Create encoder from components (for weight loading).
-    pub fn new(conv: ConvDownsampler<B>, rope: RoPE<B>, layers: Vec<EncoderLayer<B>>) -> Self {
-        Self { conv, rope, layers }
+    pub fn new(
+        conv: ConvDownsampler<B>,
+        rope: RoPE<B>,
+        layers: Vec<EncoderLayer<B>>,
+        norm: RmsNorm<B>,
+    ) -> Self {
+        Self {
+            conv,
+            rope,
+            layers,
+            norm,
+        }
     }
 
     /// Forward pass.
@@ -134,7 +156,8 @@ impl<B: Backend> AudioEncoder<B> {
             x = layer.forward(x, &self.rope, offset);
         }
 
-        x
+        // Final layer norm
+        self.norm.forward(x)
     }
 
     /// Forward pass with KV cache.
@@ -162,7 +185,8 @@ impl<B: Backend> AudioEncoder<B> {
             }
         }
 
-        x
+        // Final layer norm
+        self.norm.forward(x)
     }
 
     /// Get the number of layers.
