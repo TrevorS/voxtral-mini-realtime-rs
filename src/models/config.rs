@@ -141,6 +141,11 @@ pub struct AudioEncoderConfig {
     /// Sliding window size for attention
     #[serde(default = "default_audio_sliding_window")]
     pub sliding_window: usize,
+    /// Maximum mel frames before chunking (default: 1500)
+    /// After 4x conv downsample, this becomes max encoder positions.
+    /// Set to None for unlimited (use sliding_window only).
+    #[serde(default = "default_max_source_positions")]
+    pub max_source_positions: Option<usize>,
     /// RoPE theta
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
@@ -171,6 +176,10 @@ impl AudioEncoderConfig {
             head_dim: v["head_dim"].as_u64().unwrap_or(64) as usize,
             hidden_dim: v["hidden_dim"].as_u64().unwrap_or(5120) as usize,
             sliding_window: v["sliding_window"].as_u64().unwrap_or(750) as usize,
+            max_source_positions: v["max_source_positions"]
+                .as_u64()
+                .map(|v| v as usize)
+                .or(Some(1500)), // Default to 1500 if null/missing
             rope_theta: v["rope_theta"].as_f64().unwrap_or(1_000_000.0),
             norm_eps: v["norm_eps"].as_f64().unwrap_or(1e-5),
             use_biases: v["use_biases"].as_bool().unwrap_or(true),
@@ -178,6 +187,26 @@ impl AudioEncoderConfig {
             ffn_type: v["ffn_type"].as_str().unwrap_or("swiglu").to_string(),
             norm_type: v["norm_type"].as_str().unwrap_or("rms_norm").to_string(),
         })
+    }
+
+    /// Maximum mel frames that can be processed in one chunk.
+    /// Returns None if unlimited (relies on sliding window only).
+    pub fn max_mel_frames(&self) -> Option<usize> {
+        self.max_source_positions
+    }
+
+    /// Maximum encoder positions after conv downsampling (4x).
+    pub fn max_encoder_positions(&self) -> Option<usize> {
+        self.max_source_positions.map(|m| m / 4)
+    }
+
+    /// Effective max positions considering both max_source_positions and sliding_window.
+    /// This is the actual limit the encoder will handle.
+    pub fn effective_max_positions(&self) -> usize {
+        match self.max_source_positions {
+            Some(max_mel) => (max_mel / 4).min(self.sliding_window),
+            None => self.sliding_window,
+        }
     }
 }
 
@@ -191,6 +220,7 @@ impl Default for AudioEncoderConfig {
             head_dim: default_audio_head_dim(),
             hidden_dim: default_audio_hidden_dim(),
             sliding_window: default_audio_sliding_window(),
+            max_source_positions: default_max_source_positions(),
             rope_theta: default_rope_theta(),
             norm_eps: default_norm_eps(),
             use_biases: true,
@@ -374,6 +404,23 @@ impl AudioInputConfig {
     pub fn raw_frame_rate(&self) -> f32 {
         self.sampling_rate as f32 / self.hop_length as f32
     }
+
+    /// Maximum audio duration in seconds for given mel frame limit.
+    pub fn max_duration_secs(&self, max_mel_frames: usize) -> f32 {
+        max_mel_frames as f32 * self.hop_length as f32 / self.sampling_rate as f32
+    }
+
+    /// Maximum audio samples for given mel frame limit.
+    pub fn max_samples(&self, max_mel_frames: usize) -> usize {
+        max_mel_frames * self.hop_length
+    }
+
+    /// Number of mel frames for given sample count.
+    pub fn mel_frames_for_samples(&self, num_samples: usize) -> usize {
+        // Account for padding in STFT: (samples + pad) / hop_length
+        // Simplified: roughly samples / hop_length
+        num_samples.div_ceil(self.hop_length)
+    }
 }
 
 impl Default for AudioInputConfig {
@@ -408,6 +455,9 @@ fn default_audio_hidden_dim() -> usize {
 }
 fn default_audio_sliding_window() -> usize {
     750
+}
+fn default_max_source_positions() -> Option<usize> {
+    Some(1500) // HuggingFace transformers default
 }
 
 fn default_llm_dim() -> usize {

@@ -28,7 +28,7 @@ Pure Rust implementation of Voxtral Mini 4B Realtime using the Burn ML framework
 | Tokenizer wrapper | ✅ Complete | Tekken tokenizer integration |
 | Model download | ✅ Complete | `scripts/download_model.py` |
 
-**Test counts:** 29 unit tests passing, clippy clean
+**Test counts:** 67 unit tests passing, clippy clean
 **Model downloaded:** 8.86 GB weights + config + tokenizer
 
 ### Development Tools ✅
@@ -43,36 +43,42 @@ Pure Rust implementation of Voxtral Mini 4B Realtime using the Burn ML framework
 **Test data generated:** `test_data/*.npy` - reference inputs/outputs for all core components
 **Rust test utilities:** `src/test_utils.rs` - load_npy, assert_tensors_close
 
-### Phase 2: Audio Encoder 🔲
+### Phase 2: Audio Encoder ✅
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Conv1d downsampler | 🔲 Pending | 128→1280→1280, stride=2, 4x downsample |
-| RMSNorm | 🔲 Pending | Standard (LLM) + ADA (encoder) variants |
-| ADA RMSNorm | 🔲 Pending | T-conditional, dim=32 |
-| RoPE embeddings | 🔲 Pending | theta=1M, head_dim=64 |
-| Causal self-attention | 🔲 Pending | MHA (32 heads), sliding window (750) |
-| SwiGLU MLP | 🔲 Pending | gate/up/down, hidden=5120 |
-| 32-layer stack | 🔲 Pending | Full transformer with biases |
+| Conv1d downsampler | ✅ Complete | 128→1280→1280, stride=2, 4x downsample, GELU |
+| RMSNorm | ✅ Complete | Validated against reference (max_diff < 1e-3) |
+| ADA RMSNorm | ✅ Complete | T-conditional, validated against reference |
+| RoPE embeddings | ✅ Complete | theta=1M, interleaved layout, validated |
+| SwiGLU MLP | ✅ Complete | gate/up/down, validated against reference |
+| Causal self-attention | ✅ Complete | MHA + GQA support, sliding window, validated |
+| EncoderLayer | ✅ Complete | Full layer with ADA norm, attn, MLP, residuals |
+| 32-layer stack | ✅ Complete | Full AudioEncoder with configurable layers |
 
-### Phase 3: Language Model 🔲
-
-| Component | Status | Notes |
-|-----------|--------|-------|
-| Token embeddings | 🔲 Pending | vocab=131072, dim=3072, tied |
-| GQA attention | 🔲 Pending | 32Q/8KV heads, head_dim=128 |
-| Sliding window | 🔲 Pending | 8192 tokens |
-| SwiGLU MLP | 🔲 Pending | hidden=9216, no biases |
-| 26-layer stack | 🔲 Pending | Full transformer |
-| LM head | 🔲 Pending | Tied with embeddings |
-
-### Phase 4: Integration 🔲
+### Phase 3: Language Model ✅
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| AudioLanguageAdapter | 🔲 Pending | Linear(5120)→GELU→Linear(3072) |
-| KV cache | 🔲 Pending | Pre-allocated, sliding window eviction |
-| Weight loading | 🔲 Pending | SafeTensors → Burn tensors |
+| Token embeddings | ✅ Complete | vocab=131072, dim=3072 |
+| GQA attention | ✅ Complete | 32Q/8KV heads, head_dim=128 |
+| Sliding window | ✅ Complete | 8192 tokens |
+| SwiGLU MLP | ✅ Complete | hidden=9216, no biases |
+| DecoderLayer | ✅ Complete | Full layer with ADA norm, GQA, MLP |
+| 26-layer stack | ✅ Complete | LanguageModel with configurable layers |
+| LM head | ✅ Complete | Tied with embeddings |
+
+### Phase 4: Integration 🔄
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| AudioLanguageAdapter | ✅ Complete | Linear(5120)→GELU→Linear(3072) |
+| VoxtralModel | ✅ Complete | Full end-to-end model combining all components |
+| Weight loading infra | ✅ Complete | SafeTensors → Burn tensors, supports F32/F16/BF16 |
+| KV cache | ✅ Complete | Concatenation-based, sliding window eviction |
+| Layer cache integration | ✅ Complete | forward_with_cache on all layers |
+| E2E forward pass | ✅ Complete | test_e2e.rs verified with random weights |
+| Full weight loading | ✅ Complete | VoxtralModelLoader loads 8GB SafeTensors into model |
 | Streaming loop | 🔲 Pending | Incremental mel + causal forward |
 
 ### Phase 5: Browser/WASM 🔲
@@ -225,7 +231,8 @@ mm_streams_embeddings.embedding_module.audio_language_projection.0.weight  # [30
 mm_streams_embeddings.embedding_module.audio_language_projection.2.weight  # [3072, 3072]
 ```
 
-**Surprise:** ADA RMSNorm is in BOTH encoder AND LLM layers (not just encoder)!
+**Correction:** ADA RMSNorm is ONLY in decoder (LLM) layers, NOT in encoder layers.
+The encoder uses standard RMSNorm. This contradicts an earlier note in this document.
 
 ## Next Steps
 
@@ -242,18 +249,33 @@ mm_streams_embeddings.embedding_module.audio_language_projection.2.weight  # [30
 ## Open Questions
 
 1. **ADA RMSNorm t_embed**: How is the temporal conditioning vector computed?
-   - Likely learned embedding based on position or audio statistics
-   - Need to inspect model weights or reference code
+   - No learned t_embed weights in the model - it must be computed or passed in
+   - Zeros works for inference but may not be optimal
+   - Need to find reference implementation to understand proper values
 
-2. **Tekken tokenizer**: Verify `tokenizers` crate can load `tekken.json`
-   - May need custom loader if format differs
+2. **Tekken tokenizer**: ✅ Resolved
+   - Custom loader implemented - HuggingFace `tokenizers` crate doesn't support Tekken format
+   - Tekken uses base64-encoded token bytes with some null token_str entries
 
-3. **Weight names**: Need to inspect SafeTensors to confirm naming convention
-   - Expected: `encoder.layers.N.*`, `model.layers.N.*`
+3. **Weight names**: ✅ Resolved
+   - Encoder: `mm_streams_embeddings.embedding_module.whisper_encoder.*`
+   - Decoder: `layers.{N}.*`
 
 4. **WASM size**: 8.86GB model needs quantization for browser
    - INT8: ~2.2GB, INT4: ~1.1GB
    - May need dynamic quantization or progressive loading
+
+5. **Model outputs all spaces**: Forward pass runs but outputs token 32 (space) for all positions
+   - Mel spectrogram normalization has been verified against Python reference
+   - Issue likely in decoder processing or t_embed handling
+   - Need reference Python inference to compare intermediate outputs
+
+## Known Issues
+
+### Mel Spectrogram Differences
+- Our Rust mel computation differs slightly from torchaudio's MelSpectrogram
+- Python reference mel (generated via `scripts/reference_inference.py`) can be loaded for testing
+- Root cause: filterbank normalization differences between librosa-style (Rust) and torchaudio
 
 ## Reference Materials
 

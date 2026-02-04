@@ -7,21 +7,23 @@ license = "Apache-2.0"
 repository = "https://github.com/tstrieber/voxtral-mini-realtime-rs"
 
 [features]
-default = ["cpu"]
-cpu = ["burn/ndarray"]
+default = ["wgpu"]
 wgpu = ["burn/wgpu"]
-cuda = ["burn/cuda-jit"]
-# All portable features for CI/testing
-all-portable = ["cpu", "cli", "hub"]
+cuda = ["burn/cuda"]
+# CPU backend - requires ARM fp16 or x86 - may not compile on all systems
+cpu = ["burn/ndarray"]
+# All portable features for CI/testing (wgpu works everywhere with GPU)
+all-portable = ["wgpu", "cli", "hub"]
 cli = ["clap", "indicatif"]
 hub = ["hf-hub"]
 
 [dependencies]
-# Burn ML framework - core with backend selection via features
-burn = { version = "*", default-features = false, features = ["std", "autodiff"] }
+# Burn ML framework - latest version with backend selection via features
+burn = { version = "0.20", default-features = false, features = ["std", "autodiff"] }
 
 # Tokenization
 tokenizers = "*"
+base64 = "0.22"
 
 # Audio processing
 hound = "*"                # WAV I/O
@@ -49,13 +51,16 @@ indicatif = { version = "*", optional = true }
 
 # HuggingFace Hub (optional)
 hf-hub = { version = "*", default-features = false, features = ["ureq"], optional = true }
+half = "2.7"
+
+# NDArray for test data loading (used by test binary too)
+ndarray = "0.16"
+ndarray-npy = "0.9"
 
 [dev-dependencies]
 criterion = "*"
 approx = "*"
 tempfile = "*"
-ndarray = "0.16"
-ndarray-npy = "0.9"
 
 [[bin]]
 name = "voxtral-transcribe"

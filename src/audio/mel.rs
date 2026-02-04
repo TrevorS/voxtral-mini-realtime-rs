@@ -116,27 +116,46 @@ impl MelSpectrogram {
         self.apply_mel_filterbank(&power_spec)
     }
 
-    /// Compute log mel spectrogram (the format Voxtral expects).
+    /// Compute log mel spectrogram (Whisper-style normalization).
     ///
     /// Returns a 2D vector of shape `[n_frames, n_mels]` with log-compressed
-    /// and normalized values.
+    /// and normalized values in roughly [-1, 1] range.
+    ///
+    /// Normalization follows Whisper's audio.py:
+    /// 1. log10(mel) with floor at 1e-10
+    /// 2. Dynamic range limit: max(log_spec, max_val - 8.0)
+    /// 3. Linear scale: (log_spec + 4.0) / 4.0
     pub fn compute_log(&self, samples: &[f32]) -> Vec<Vec<f32>> {
         let mel = self.compute(samples);
-        let log_mel_max = self.config.log_mel_max;
 
-        mel.into_iter()
-            .map(|frame| {
-                frame
-                    .into_iter()
-                    .map(|v| {
-                        // Log compression with floor, then normalize by global max
-                        let log_val = (v.max(1e-10)).ln();
-                        // Clamp to reasonable range and normalize
-                        (log_val / log_mel_max).clamp(-1.0, 1.0)
-                    })
-                    .collect()
-            })
-            .collect()
+        // Step 1: log10 with floor
+        let mut log_mel: Vec<Vec<f32>> = mel
+            .into_iter()
+            .map(|frame| frame.into_iter().map(|v| v.max(1e-10).log10()).collect())
+            .collect();
+
+        // Step 2: Find global max and apply dynamic range limit (8.0 range)
+        let global_max: f32 = log_mel
+            .iter()
+            .flat_map(|frame| frame.iter())
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_val = global_max - 8.0;
+
+        for frame in &mut log_mel {
+            for v in frame.iter_mut() {
+                *v = v.max(min_val);
+            }
+        }
+
+        // Step 3: Linear scale to roughly [-1, 1] and clamp
+        for frame in &mut log_mel {
+            for v in frame.iter_mut() {
+                *v = ((*v + 4.0) / 4.0).clamp(-1.0, 1.0);
+            }
+        }
+
+        log_mel
     }
 
     /// Compute log mel spectrogram and return as flat vector.
