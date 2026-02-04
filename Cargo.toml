@@ -1,0 +1,68 @@
+[package]
+name = "voxtral-mini-realtime"
+version = "0.1.0"
+edition = "2021"
+description = "Voxtral Mini 4B Realtime - Streaming ASR in Rust with Burn"
+license = "Apache-2.0"
+repository = "https://github.com/tstrieber/voxtral-mini-realtime-rs"
+
+[features]
+default = ["cpu"]
+cpu = ["burn/ndarray"]
+wgpu = ["burn/wgpu"]
+cuda = ["burn/cuda-jit"]
+# All portable features for CI/testing
+all-portable = ["cpu", "cli", "hub"]
+cli = ["clap", "indicatif"]
+hub = ["hf-hub"]
+
+[dependencies]
+# Burn ML framework - core with backend selection via features
+burn = { version = "*", default-features = false, features = ["std", "autodiff"] }
+
+# Tokenization
+tokenizers = "*"
+
+# Audio processing
+hound = "*"                # WAV I/O
+rubato = "*"               # High-quality resampling
+rustfft = "*"              # FFT for spectrograms
+audioadapter-buffers = "*" # Buffer adapters for rubato
+
+# Serialization & model loading
+safetensors = "*"
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+
+# Utilities
+anyhow = "*"
+thiserror = "*"
+tracing = "*"
+tracing-subscriber = "*"
+num-traits = "*"
+num-complex = "*"
+byteorder = "*"
+
+# CLI (optional)
+clap = { version = "*", features = ["derive"], optional = true }
+indicatif = { version = "*", optional = true }
+
+# HuggingFace Hub (optional)
+hf-hub = { version = "*", default-features = false, features = ["ureq"], optional = true }
+
+[dev-dependencies]
+criterion = "*"
+approx = "*"
+tempfile = "*"
+ndarray = "0.16"
+ndarray-npy = "0.9"
+
+[[bin]]
+name = "voxtral-transcribe"
+path = "src/bin/transcribe.rs"
+required-features = ["cli"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

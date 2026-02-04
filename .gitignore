@@ -1,0 +1,13 @@
+/target
+Cargo.lock
+*.swp
+*.swo
+.DS_Store
+
+# Model weights (too large for git)
+*.safetensors
+*.bin
+/models/
+
+# Test data
+test_data/
