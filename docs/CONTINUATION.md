@@ -28,8 +28,9 @@ Pure Rust implementation of Voxtral Mini 4B Realtime using the Burn ML framework
 | Tokenizer wrapper | ✅ Complete | Tekken tokenizer integration |
 | Model download | ✅ Complete | `scripts/download_model.py` |
 
-**Test counts:** 67 unit tests passing, clippy clean
+**Test counts:** 79 unit tests passing, clippy clean
 **Model downloaded:** 8.86 GB weights + config + tokenizer
+**GitHub:** https://github.com/TrevorS/voxtral-mini-realtime-rs (private)
 
 ### Development Tools ✅
 
@@ -68,7 +69,7 @@ Pure Rust implementation of Voxtral Mini 4B Realtime using the Burn ML framework
 | 26-layer stack | ✅ Complete | LanguageModel with configurable layers |
 | LM head | ✅ Complete | Tied with embeddings |
 
-### Phase 4: Integration 🔄
+### Phase 4: Integration ✅
 
 | Component | Status | Notes |
 |-----------|--------|-------|
@@ -79,6 +80,8 @@ Pure Rust implementation of Voxtral Mini 4B Realtime using the Burn ML framework
 | Layer cache integration | ✅ Complete | forward_with_cache on all layers |
 | E2E forward pass | ✅ Complete | test_e2e.rs verified with random weights |
 | Full weight loading | ✅ Complete | VoxtralModelLoader loads 8GB SafeTensors into model |
+| Audio chunking | ✅ Complete | max_source_positions=1500 (~15 sec), ChunkIterator |
+| Memory safety | ✅ Complete | OwnedSafeTensors (Arc-based), OnceLock shared test loaders |
 | Streaming loop | 🔲 Pending | Incremental mel + causal forward |
 
 ### Phase 5: Browser/WASM 🔲
@@ -95,11 +98,13 @@ Pure Rust implementation of Voxtral Mini 4B Realtime using the Burn ML framework
 ```
 voxtral-mini-realtime-rs/
 ├── Cargo.toml              # Burn framework, CPU/WGPU/CUDA features
+├── CLAUDE.md               # Claude Code guidance
 ├── scripts/
 │   ├── download_model.py   # HuggingFace model download
 │   ├── inspect_weights.py  # SafeTensors browser
 │   ├── dump_weight_names.py # Full weight paths
 │   ├── reference_forward.py # Generate test data
+│   ├── reference_inference.py # Python inference reference
 │   └── compare_tensors.py  # Validate Rust vs Python
 ├── test_data/              # Reference tensors (gitignored)
 ├── models/
@@ -110,18 +115,38 @@ voxtral-mini-realtime-rs/
 ├── src/
 │   ├── lib.rs              # Public API (VoxtralRealtime<B>)
 │   ├── main.rs             # Simple placeholder
+│   ├── test_utils.rs       # Test utilities (load_npy, etc.)
 │   ├── models/
 │   │   ├── mod.rs
-│   │   └── config.rs       # VoxtralConfig parser (verified)
+│   │   ├── config.rs       # VoxtralConfig parser (verified)
+│   │   ├── encoder.rs      # AudioEncoder (32 layers)
+│   │   ├── decoder.rs      # LanguageModel (26 layers)
+│   │   ├── adapter.rs      # AudioLanguageAdapter
+│   │   ├── voxtral.rs      # Complete VoxtralModel
+│   │   ├── loader.rs       # VoxtralModelLoader (SafeTensors)
+│   │   ├── weights.rs      # OwnedSafeTensors, weight names
+│   │   └── layers/
+│   │       ├── mod.rs
+│   │       ├── attention.rs  # MHA/GQA with RoPE, sliding window
+│   │       ├── rope.rs       # Rotary position embeddings
+│   │       ├── rms_norm.rs   # RMSNorm + ADA RMSNorm
+│   │       ├── swiglu.rs     # SwiGLU MLP
+│   │       ├── conv.rs       # ConvDownsampler
+│   │       ├── encoder_layer.rs
+│   │       ├── decoder_layer.rs
+│   │       └── kv_cache.rs   # KV cache for streaming
 │   ├── audio/
 │   │   ├── mod.rs
 │   │   ├── io.rs           # AudioBuffer, WAV I/O
 │   │   ├── mel.rs          # MelSpectrogram extractor
+│   │   ├── chunk.rs        # Audio chunking (max_source_positions)
 │   │   └── resample.rs     # FFT-based resampling
 │   ├── tokenizer/
 │   │   └── mod.rs          # Tekken tokenizer wrapper
 │   └── bin/
-│       └── transcribe.rs   # CLI stub
+│       ├── transcribe.rs   # CLI stub
+│       ├── test_e2e.rs     # E2E test with random weights
+│       └── test_inference.rs # Full inference test
 └── docs/
     ├── VOXTRAL_ARCHITECTURE.md  # Model deep dive (verified)
     ├── CONTINUATION.md          # This file
@@ -238,13 +263,18 @@ The encoder uses standard RMSNorm. This contradicts an earlier note in this docu
 
 1. ~~Download model weights~~ ✅
 2. ~~Verify config parsing~~ ✅
-3. Inspect SafeTensors weight names
-4. Implement shared components (RMSNorm, RoPE, SwiGLU)
-5. Build audio encoder layer by layer
-6. Validate against Python reference
-7. Implement LLM decoder
-8. Wire up streaming pipeline
-9. Test WGPU backend
+3. ~~Inspect SafeTensors weight names~~ ✅
+4. ~~Implement shared components (RMSNorm, RoPE, SwiGLU)~~ ✅
+5. ~~Build audio encoder layer by layer~~ ✅
+6. ~~Validate against Python reference~~ ✅
+7. ~~Implement LLM decoder~~ ✅
+8. ~~Full weight loading~~ ✅
+9. ~~Memory safety (Arc-based SafeTensors, shared test loaders)~~ ✅
+10. ~~Audio chunking for max_source_positions~~ ✅
+11. Debug model output (currently outputs spaces) - need reference comparison
+12. Wire up streaming pipeline
+13. Test WGPU backend
+14. WASM/browser support
 
 ## Open Questions
 
@@ -272,10 +302,27 @@ The encoder uses standard RMSNorm. This contradicts an earlier note in this docu
 
 ## Known Issues
 
+### Model Outputs Spaces
+- Forward pass runs but outputs token 32 (space) for all positions
+- Mel spectrogram normalization verified, issue likely in decoder or t_embed
+- Need reference Python inference to compare intermediate outputs
+
 ### Mel Spectrogram Differences
 - Our Rust mel computation differs slightly from torchaudio's MelSpectrogram
 - Python reference mel (generated via `scripts/reference_inference.py`) can be loaded for testing
 - Root cause: filterbank normalization differences between librosa-style (Rust) and torchaudio
+
+## Resolved Issues
+
+### Memory Leak / OOM in Tests (Fixed)
+- **Problem:** `Box::leak` in SafeTensors loading caused 8GB leak per load; parallel tests caused OOM
+- **Solution:** `OwnedSafeTensors` uses `Arc<Vec<u8>>` - memory freed when dropped
+- **Tests:** Use `OnceLock` shared loaders to load model once across all tests
+
+### max_source_positions Constraint (Implemented)
+- **Problem:** vLLM/mistral-common enforces max mel frames (default 1500 ≈ 15 sec)
+- **Solution:** Added `max_source_positions` to config, `ChunkConfig` and `chunk_audio()` for splitting
+- **Key values:** 1500 mel frames → 375 encoder positions (after 4x conv downsample)
 
 ## Reference Materials
 
