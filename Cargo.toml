@@ -18,17 +18,8 @@ cli = ["clap", "indicatif"]
 hub = ["hf-hub"]
 # Native tokenizer (has C dependencies, not WASM compatible)
 native-tokenizer = ["tokenizers"]
-# WASM/browser support - uses ndarray backend (CPU) or wgpu (WebGPU)
+# WASM/browser support - uses wgpu (WebGPU) backend for GPU inference
 wasm = [
-    "burn/ndarray",
-    "wasm-bindgen",
-    "wasm-bindgen-futures",
-    "js-sys",
-    "web-sys",
-    "console_error_panic_hook",
-    "getrandom/wasm_js",
-]
-wasm-wgpu = [
     "burn/wgpu",
     "wasm-bindgen",
     "wasm-bindgen-futures",
@@ -65,6 +56,7 @@ tracing-subscriber = "*"
 num-traits = "*"
 num-complex = "*"
 byteorder = "*"
+flate2 = "*"
 
 # CLI (optional)
 clap = { version = "*", features = ["derive"], optional = true }
@@ -95,6 +87,21 @@ tempfile = "*"
 name = "voxtral-transcribe"
 path = "src/bin/transcribe.rs"
 required-features = ["cli"]
+
+[[bin]]
+name = "shard_safetensors"
+path = "src/bin/shard_safetensors.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "quantize_model"
+path = "src/bin/quantize_model.rs"
+required-features = ["cli", "cpu"]
+
+[[bin]]
+name = "test_accuracy"
+path = "src/bin/test_accuracy.rs"
+required-features = ["cli", "cpu"]
 
 # WASM library target
 [lib]

@@ -65,6 +65,94 @@ pub fn load_tensor<B: Backend, const D: usize>(
     Ok(tensor)
 }
 
+/// Load a single named tensor directly from raw safetensors bytes.
+///
+/// This bypasses `SafeTensors::deserialize` to avoid a `usize` overflow
+/// in the crate's validation on wasm32: for tensors with > 268M elements,
+/// the intermediate `nelements * bitsize_in_bits` exceeds `u32::MAX`.
+///
+/// The byte-level size is fine — only the bits calculation overflows.
+pub fn load_tensor_raw<B: Backend, const D: usize>(
+    bytes: &[u8],
+    name: &str,
+    device: &B::Device,
+) -> Result<Tensor<B, D>> {
+    use anyhow::bail;
+
+    if bytes.len() < 8 {
+        bail!("Safetensors data too short for header length");
+    }
+
+    let header_size = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+    if 8 + header_size > bytes.len() {
+        bail!(
+            "Safetensors header size {} exceeds file length {}",
+            header_size,
+            bytes.len()
+        );
+    }
+
+    let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_size])
+        .context("Failed to parse safetensors header JSON")?;
+
+    let info = header
+        .get(name)
+        .with_context(|| format!("Tensor '{}' not found in safetensors header", name))?;
+
+    let dtype_str = info["dtype"]
+        .as_str()
+        .context("Missing dtype in tensor info")?;
+    let shape: Vec<usize> = info["shape"]
+        .as_array()
+        .context("Missing shape in tensor info")?
+        .iter()
+        .map(|v| v.as_u64().unwrap() as usize)
+        .collect();
+    let start = info["data_offsets"][0]
+        .as_u64()
+        .context("Missing data_offsets[0]")? as usize;
+    let end = info["data_offsets"][1]
+        .as_u64()
+        .context("Missing data_offsets[1]")? as usize;
+
+    let data_start = 8 + header_size;
+    if data_start + end > bytes.len() {
+        bail!(
+            "Tensor '{}' data range [{}, {}) exceeds file length {}",
+            name,
+            data_start + start,
+            data_start + end,
+            bytes.len()
+        );
+    }
+    let tensor_bytes = &bytes[data_start + start..data_start + end];
+
+    let data: Vec<f32> = match dtype_str {
+        "F32" => tensor_bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        "F16" => tensor_bytes
+            .chunks_exact(2)
+            .map(|b| {
+                let bits = u16::from_le_bytes([b[0], b[1]]);
+                half::f16::from_bits(bits).to_f32()
+            })
+            .collect(),
+        "BF16" => tensor_bytes
+            .chunks_exact(2)
+            .map(|b| {
+                let bits = u16::from_le_bytes([b[0], b[1]]);
+                half::bf16::from_bits(bits).to_f32()
+            })
+            .collect(),
+        _ => bail!("Unsupported dtype: {}", dtype_str),
+    };
+
+    let tensor_data = TensorData::new(data, shape);
+    Ok(Tensor::from_data(tensor_data, device))
+}
+
 /// Owning wrapper for SafeTensors that keeps bytes alive without leaking.
 ///
 /// This struct owns the raw bytes and provides safe access to the SafeTensors

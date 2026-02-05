@@ -12,6 +12,17 @@ use super::layers::{
     DecoderLayer, DecoderLayerConfig, LayerCaches, RmsNorm, RmsNormConfig, RoPE, RoPEConfig,
 };
 
+/// Decomposed parts of a LanguageModel, for per-layer streaming serialization.
+///
+/// RoPE is excluded because it contains no learned parameters — it's
+/// recomputed from config at init time.
+pub struct DecoderParts<B: Backend> {
+    pub tok_embeddings: Embedding<B>,
+    pub layers: Vec<DecoderLayer<B>>,
+    pub norm: RmsNorm<B>,
+    pub d_model: usize,
+}
+
 /// Language model configuration.
 #[derive(Config, Debug)]
 pub struct LanguageModelConfig {
@@ -84,6 +95,42 @@ pub struct LanguageModel<B: Backend> {
 }
 
 impl LanguageModelConfig {
+    /// Initialize just the token embedding layer.
+    pub fn init_embeddings<B: Backend>(&self, device: &B::Device) -> Embedding<B> {
+        EmbeddingConfig::new(self.vocab_size, self.d_model).init(device)
+    }
+
+    /// Initialize a single decoder transformer layer.
+    pub fn init_single_layer<B: Backend>(&self, device: &B::Device) -> DecoderLayer<B> {
+        DecoderLayerConfig::new(
+            self.d_model,
+            self.n_heads,
+            self.n_kv_heads,
+            self.head_dim,
+            self.mlp_hidden_dim,
+            self.t_cond_dim,
+        )
+        .with_sliding_window(self.sliding_window)
+        .with_norm_eps(self.norm_eps)
+        .init(device)
+    }
+
+    /// Initialize just the final RMS normalization layer.
+    pub fn init_norm<B: Backend>(&self, device: &B::Device) -> RmsNorm<B> {
+        RmsNormConfig::new(self.d_model)
+            .with_eps(self.norm_eps)
+            .init(device)
+    }
+
+    /// Initialize RoPE (rotary position embeddings).
+    ///
+    /// RoPE has no learned parameters — it's computed from config.
+    pub fn init_rope<B: Backend>(&self, device: &B::Device) -> RoPE<B> {
+        RoPEConfig::new(self.head_dim, self.max_seq_len)
+            .with_theta(self.rope_theta)
+            .init(device)
+    }
+
     /// Initialize the language model.
     pub fn init<B: Backend>(&self, device: &B::Device) -> LanguageModel<B> {
         let tok_embeddings = EmbeddingConfig::new(self.vocab_size, self.d_model).init(device);
@@ -302,6 +349,32 @@ impl<B: Backend> LanguageModel<B> {
     pub fn create_cache(&self) -> LayerCaches<B> {
         LayerCaches::new(self.layers.len())
     }
+
+    /// Decompose the decoder into its parts for per-layer serialization.
+    ///
+    /// RoPE is excluded (recomputed from config, no learned weights).
+    pub fn into_parts(self) -> DecoderParts<B> {
+        DecoderParts {
+            tok_embeddings: self.tok_embeddings,
+            layers: self.layers,
+            norm: self.norm,
+            d_model: self.d_model,
+        }
+    }
+
+    /// Assemble a decoder from individually loaded parts.
+    ///
+    /// `rope` must be initialized separately from config since it has no
+    /// learned parameters and is not serialized.
+    pub fn from_parts(parts: DecoderParts<B>, rope: RoPE<B>) -> Self {
+        Self {
+            tok_embeddings: parts.tok_embeddings,
+            rope,
+            layers: parts.layers,
+            norm: parts.norm,
+            d_model: parts.d_model,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -358,6 +431,79 @@ mod tests {
         let out = model.forward_hidden(hidden, t_embed, 0);
 
         assert_eq!(out.dims(), [1, 20, 64]);
+    }
+
+    #[test]
+    fn test_into_parts_from_parts_roundtrip() {
+        let device = Default::default();
+
+        let config = LanguageModelConfig::new(1000, 64, 2, 4)
+            .with_n_kv_heads(2)
+            .with_head_dim(16)
+            .with_mlp_hidden_dim(256)
+            .with_t_cond_dim(8)
+            .with_sliding_window(Some(32))
+            .with_max_seq_len(512);
+
+        // Build a model and run forward to get reference output
+        let model = config.init::<TestBackend>(&device);
+
+        let hidden_input = Tensor::<TestBackend, 3>::ones([1, 5, 64], &device);
+        let t_embed = Tensor::<TestBackend, 3>::zeros([1, 1, 64], &device);
+
+        let ref_output = model.forward_hidden(hidden_input.clone(), t_embed.clone(), 0);
+        let ref_data: Vec<f32> = ref_output.to_data().to_vec().unwrap();
+
+        // Decompose and reassemble
+        let parts = model.into_parts();
+        let rope = config.init_rope::<TestBackend>(&device);
+        let reassembled = LanguageModel::from_parts(parts, rope);
+
+        // Run same forward pass on reassembled model
+        let round_output = reassembled.forward_hidden(hidden_input, t_embed, 0);
+        let round_data: Vec<f32> = round_output.to_data().to_vec().unwrap();
+
+        // Verify identical output (same weights, same RoPE freqs)
+        assert_eq!(ref_data.len(), round_data.len());
+        for (i, (a, b)) in ref_data.iter().zip(round_data.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "Mismatch at index {}: {} vs {}",
+                i,
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn test_per_component_init() {
+        let device = Default::default();
+
+        let config = LanguageModelConfig::new(1000, 64, 2, 4)
+            .with_n_kv_heads(2)
+            .with_head_dim(16)
+            .with_mlp_hidden_dim(256)
+            .with_t_cond_dim(8)
+            .with_sliding_window(Some(32))
+            .with_max_seq_len(512);
+
+        // Verify each per-component init produces the right types/shapes
+        let emb = config.init_embeddings::<TestBackend>(&device);
+        assert_eq!(emb.weight.val().dims(), [1000, 64]);
+
+        let layer = config.init_single_layer::<TestBackend>(&device);
+        // Just verify it exists and can run forward
+        let x = Tensor::<TestBackend, 3>::zeros([1, 3, 64], &device);
+        let t = Tensor::<TestBackend, 3>::zeros([1, 1, 64], &device);
+        let rope = config.init_rope::<TestBackend>(&device);
+        let out = layer.forward(x, t, &rope, 0);
+        assert_eq!(out.dims(), [1, 3, 64]);
+
+        let norm = config.init_norm::<TestBackend>(&device);
+        let x = Tensor::<TestBackend, 3>::ones([1, 3, 64], &device);
+        let out = norm.forward(x);
+        assert_eq!(out.dims(), [1, 3, 64]);
     }
 
     #[test]

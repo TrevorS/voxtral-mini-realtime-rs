@@ -34,68 +34,6 @@ pub fn load_test_data(name: &str) -> Result<ArrayD<f32>> {
     load_npy(&path)
 }
 
-/// Compare two arrays with given tolerances.
-#[cfg(test)]
-pub fn assert_tensors_close(
-    reference: &ArrayD<f32>,
-    actual: &ArrayD<f32>,
-    rtol: f32,
-    atol: f32,
-    name: &str,
-) {
-    assert_eq!(
-        reference.shape(),
-        actual.shape(),
-        "{}: shape mismatch: {:?} vs {:?}",
-        name,
-        reference.shape(),
-        actual.shape()
-    );
-
-    let mut max_abs_diff: f32 = 0.0;
-    let mut max_rel_diff: f32 = 0.0;
-    let mut fail_count = 0;
-
-    for (r, a) in reference.iter().zip(actual.iter()) {
-        let abs_diff = (r - a).abs();
-        let rel_diff = abs_diff / (r.abs() + 1e-10);
-
-        max_abs_diff = max_abs_diff.max(abs_diff);
-        max_rel_diff = max_rel_diff.max(rel_diff);
-
-        if abs_diff > atol && rel_diff > rtol {
-            fail_count += 1;
-        }
-    }
-
-    let total = reference.len();
-    let pass_rate = (total - fail_count) as f32 / total as f32 * 100.0;
-
-    if fail_count > 0 {
-        panic!(
-            "{}: tensor mismatch\n\
-             Max abs diff: {:.2e}\n\
-             Max rel diff: {:.2e}\n\
-             Pass rate: {:.1}% ({}/{})\n\
-             Reference mean: {:.4}\n\
-             Actual mean: {:.4}",
-            name,
-            max_abs_diff,
-            max_rel_diff,
-            pass_rate,
-            total - fail_count,
-            total,
-            reference.mean().unwrap_or(0.0),
-            actual.mean().unwrap_or(0.0),
-        );
-    }
-
-    println!(
-        "{}: PASS (max_abs={:.2e}, max_rel={:.2e})",
-        name, max_abs_diff, max_rel_diff
-    );
-}
-
 /// Check if test data exists.
 #[cfg(test)]
 pub fn test_data_exists(name: &str) -> bool {

@@ -1,7 +1,7 @@
 //! WASM/browser bindings for Voxtral Mini 4B Realtime.
 //!
-//! This module provides JavaScript-callable APIs for audio transcription in the browser.
-//! Uses wasm-bindgen for JS interop and supports both ndarray (CPU) and wgpu (WebGPU) backends.
+//! This module provides JavaScript-callable APIs for GPU-accelerated audio
+//! transcription in the browser via WebGPU (wgpu backend).
 //!
 //! ## Usage from JavaScript
 //!
@@ -17,14 +17,6 @@
 //! console.log(text);
 //! ```
 
-#[cfg(feature = "wasm")]
 mod bindings;
 
-#[cfg(feature = "wasm")]
 pub use bindings::*;
-
-#[cfg(feature = "wasm-wgpu")]
-mod bindings_wgpu;
-
-#[cfg(feature = "wasm-wgpu")]
-pub use bindings_wgpu::*;

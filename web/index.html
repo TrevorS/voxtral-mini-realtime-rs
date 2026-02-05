@@ -265,23 +265,14 @@
             <div class="progress" id="progress-container" style="display: none;">
                 <div class="progress-bar" id="progress-bar"></div>
             </div>
-            <div class="input-row">
-                <div class="input-group">
-                    <div class="file-input">
-                        <input type="file" id="model-file" accept=".safetensors">
-                        <label for="model-file" id="model-label">Load model (consolidated.safetensors)</label>
-                    </div>
-                </div>
-                <div class="input-group">
-                    <div class="file-input">
-                        <input type="file" id="tokenizer-file" accept=".json">
-                        <label for="tokenizer-file" id="tokenizer-label">Load tokenizer (tekken.json)</label>
-                    </div>
-                </div>
+            <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                <button id="load-btn" disabled>Load Model from Server</button>
+                <span id="cache-info" class="info"></span>
+                <button id="clear-cache-btn" class="secondary" style="display: none;">Clear Cache</button>
             </div>
             <p class="info">
-                Model size: ~8GB. Download from
-                <code>mistralai/Voxtral-Mini-4B-Realtime-2602</code> on HuggingFace.
+                Shards are cached in the browser after first fetch.
+                Subsequent transcriptions load from cache instantly.
             </p>
         </div>
 
@@ -328,6 +319,17 @@
 
         const client = new VoxtralClient();
 
+        // Server shard URLs
+        const SHARDS_BASE = '/models/shards-safetensors';
+        const TOKENIZER_URL = '/models/voxtral/tekken.json';
+        const serverUrls = {
+            tokenizer: TOKENIZER_URL,
+            encoder: `${SHARDS_BASE}/encoder.safetensors.gz`,
+            adapter: `${SHARDS_BASE}/adapter.safetensors.gz`,
+            manifest: `${SHARDS_BASE}/manifest.json`,
+            baseUrl: SHARDS_BASE,
+        };
+
         // UI elements
         const statusDot = document.getElementById('status-dot');
         const statusText = document.getElementById('status-text');
@@ -335,8 +337,7 @@
         const progressBar = document.getElementById('progress-bar');
         const transcriptionEl = document.getElementById('transcription');
         const audioInfo = document.getElementById('audio-info');
-        const modelLabel = document.getElementById('model-label');
-        const tokenizerLabel = document.getElementById('tokenizer-label');
+        const loadBtn = document.getElementById('load-btn');
 
         // Buttons
         const micBtn = document.getElementById('mic-btn');
@@ -348,9 +349,28 @@
         const micVisualizer = document.getElementById('mic-visualizer');
         const recTimer = document.getElementById('rec-timer');
 
+        // Cache UI
+        const cacheInfo = document.getElementById('cache-info');
+        const clearCacheBtn = document.getElementById('clear-cache-btn');
+
+        async function updateCacheInfo() {
+            const count = await VoxtralClient.getCachedShardCount();
+            if (count > 0) {
+                cacheInfo.textContent = `(${count} shards cached)`;
+                clearCacheBtn.style.display = '';
+            } else {
+                cacheInfo.textContent = '';
+                clearCacheBtn.style.display = 'none';
+            }
+        }
+
+        clearCacheBtn.addEventListener('click', async () => {
+            await VoxtralClient.clearCache();
+            updateCacheInfo();
+        });
+
         // State
-        let modelBytes = null;
-        let tokenizerJson = null;
+        let serverReady = false;
         let audioFile = null;
         let recStartTime = null;
         let recTimerInterval = null;
@@ -361,130 +381,90 @@
         }
 
         function updateButtons() {
-            const ready = client.isReady();
-            micBtn.disabled = !ready;
-            transcribeBtn.disabled = !(ready && audioFile);
+            micBtn.disabled = !serverReady;
+            transcribeBtn.disabled = !(serverReady && audioFile);
         }
 
         // Progress callback
         client.setProgressCallback((stage, percent) => {
             updateStatus('loading', stage);
             if (percent !== undefined) {
+                progressContainer.style.display = 'block';
                 progressBar.style.width = percent + '%';
             }
         });
 
-        // Initialize client
+        // Initialize WASM
         async function initClient() {
             try {
-                updateStatus('loading', 'Initializing WASM...');
+                updateStatus('loading', 'Initializing WASM + WebGPU...');
                 await client.init();
-                updateStatus('', 'Ready. Load model files.');
+                updateStatus('', 'WASM ready. Click "Load Model from Server".');
+                loadBtn.disabled = false;
+                updateCacheInfo();
             } catch (e) {
                 updateStatus('error', 'Failed to initialize: ' + e.message);
                 console.error(e);
             }
         }
 
-        // Load model file
-        document.getElementById('model-file').addEventListener('change', async (e) => {
-            const file = e.target.files[0];
-            if (!file) return;
-
-            updateStatus('loading', 'Loading model weights...');
-            progressContainer.style.display = 'block';
-
+        // Load model from server (validates shards exist)
+        loadBtn.addEventListener('click', async () => {
+            loadBtn.disabled = true;
             try {
-                const reader = new FileReader();
-                reader.onprogress = (e) => {
-                    if (e.lengthComputable) {
-                        progressBar.style.width = (e.loaded / e.total * 100) + '%';
-                    }
-                };
-                reader.onload = async () => {
-                    modelBytes = new Uint8Array(reader.result);
-                    modelLabel.classList.add('loaded');
-                    modelLabel.textContent = `Model loaded (${(file.size / 1e9).toFixed(2)} GB)`;
-                    progressContainer.style.display = 'none';
+                updateStatus('loading', 'Checking server for model shards...');
 
-                    if (modelBytes && tokenizerJson) {
-                        await loadModel();
-                    } else {
-                        updateStatus('', 'Model loaded. Now load tokenizer.');
-                    }
-                };
-                reader.readAsArrayBuffer(file);
-            } catch (e) {
-                updateStatus('error', 'Failed to load model: ' + e.message);
-                console.error(e);
-            }
-        });
+                const manifestResp = await fetch(serverUrls.manifest);
+                if (!manifestResp.ok) throw new Error('Manifest not found on server');
+                const manifest = await manifestResp.json();
 
-        // Load tokenizer file
-        document.getElementById('tokenizer-file').addEventListener('change', async (e) => {
-            const file = e.target.files[0];
-            if (!file) return;
+                // Quick check that tokenizer is available
+                const tokResp = await fetch(serverUrls.tokenizer, { method: 'HEAD' });
+                if (!tokResp.ok) throw new Error('Tokenizer not found on server');
 
-            try {
-                tokenizerJson = await file.text();
-                tokenizerLabel.classList.add('loaded');
-                tokenizerLabel.textContent = 'Tokenizer loaded';
-
-                if (modelBytes && tokenizerJson) {
-                    await loadModel();
-                } else {
-                    updateStatus('', 'Tokenizer loaded. Now load model.');
-                }
-            } catch (e) {
-                updateStatus('error', 'Failed to load tokenizer: ' + e.message);
-                console.error(e);
-            }
-        });
-
-        async function loadModel() {
-            updateStatus('loading', 'Initializing model...');
-            try {
-                await client.loadModel(modelBytes, tokenizerJson);
-                updateStatus('ready', 'Model ready!');
+                serverReady = true;
+                const sizeGB = (manifest.total_size / 1e9).toFixed(1);
+                updateStatus('ready', `Model available (${manifest.shards.length} shards, ${sizeGB} GB). Select audio to transcribe.`);
                 updateButtons();
             } catch (e) {
-                updateStatus('error', 'Failed to initialize model: ' + e.message);
+                updateStatus('error', 'Server error: ' + e.message);
+                loadBtn.disabled = false;
                 console.error(e);
             }
-        }
+        });
 
         // Load audio file
         document.getElementById('audio-file').addEventListener('change', async (e) => {
             audioFile = e.target.files[0];
             if (!audioFile) return;
-
-            try {
-                // Get basic info
-                audioInfo.textContent = `File: ${audioFile.name} (${(audioFile.size / 1024).toFixed(1)} KB)`;
-                updateButtons();
-            } catch (e) {
-                audioInfo.textContent = 'Failed to load audio: ' + e.message;
-                console.error(e);
-            }
+            audioInfo.textContent = `File: ${audioFile.name} (${(audioFile.size / 1024).toFixed(1)} KB)`;
+            updateButtons();
         });
 
-        // Transcribe file
+        // Transcribe file (phased pipeline)
         transcribeBtn.addEventListener('click', async () => {
-            if (!client.isReady() || !audioFile) return;
+            if (!serverReady || !audioFile) return;
 
             transcribeBtn.disabled = true;
-            transcriptionEl.textContent = 'Transcribing...';
+            micBtn.disabled = true;
+            progressContainer.style.display = 'block';
+            transcriptionEl.textContent = 'Loading shards and transcribing...';
             transcriptionEl.classList.add('empty');
 
             try {
-                const text = await client.transcribeFile(audioFile);
+                const text = await client.transcribeFilePhased(audioFile, serverUrls);
                 transcriptionEl.textContent = text || '(No speech detected)';
                 transcriptionEl.classList.remove('empty');
+                progressContainer.style.display = 'none';
+                updateStatus('ready', 'Done! Select audio to transcribe again.');
+                updateCacheInfo();
             } catch (e) {
-                transcriptionEl.textContent = 'Error: ' + e.message;
+                transcriptionEl.textContent = 'Error: ' + (e.message || String(e));
+                updateStatus('error', 'Transcription failed');
+                progressContainer.style.display = 'none';
                 console.error(e);
             } finally {
-                transcribeBtn.disabled = false;
+                updateButtons();
             }
         });
 
@@ -501,18 +481,15 @@
             try {
                 await client.startMicrophone();
 
-                // Update UI
                 micBtn.style.display = 'none';
                 stopMicBtn.style.display = '';
                 cancelMicBtn.style.display = '';
                 micVisualizer.classList.add('active');
                 statusDot.classList.add('recording');
 
-                // Start timer
                 recStartTime = Date.now();
                 recTimerInterval = setInterval(updateRecTimer, 1000);
                 updateRecTimer();
-
             } catch (e) {
                 updateStatus('error', 'Microphone error: ' + e.message);
                 console.error(e);
@@ -520,49 +497,50 @@
         });
 
         stopMicBtn.addEventListener('click', async () => {
-            // Stop timer
             clearInterval(recTimerInterval);
             recTimerInterval = null;
 
-            // Update UI
             micBtn.style.display = '';
             stopMicBtn.style.display = 'none';
             cancelMicBtn.style.display = 'none';
             micVisualizer.classList.remove('active');
             statusDot.classList.remove('recording');
 
-            transcriptionEl.textContent = 'Transcribing...';
+            progressContainer.style.display = 'block';
+            transcriptionEl.textContent = 'Loading shards and transcribing...';
             transcriptionEl.classList.add('empty');
 
             try {
-                const text = await client.stopAndTranscribe();
+                const text = await client.stopAndTranscribePhased(serverUrls);
                 transcriptionEl.textContent = text || '(No speech detected)';
                 transcriptionEl.classList.remove('empty');
-                updateStatus('ready', 'Model ready!');
+                progressContainer.style.display = 'none';
+                updateStatus('ready', 'Done!');
+                updateCacheInfo();
             } catch (e) {
-                transcriptionEl.textContent = 'Error: ' + e.message;
+                transcriptionEl.textContent = 'Error: ' + (e.message || String(e));
                 updateStatus('error', 'Transcription failed');
+                progressContainer.style.display = 'none';
                 console.error(e);
+            } finally {
+                updateButtons();
             }
         });
 
         cancelMicBtn.addEventListener('click', () => {
             client.cancelMicrophone();
 
-            // Stop timer
             clearInterval(recTimerInterval);
             recTimerInterval = null;
 
-            // Update UI
             micBtn.style.display = '';
             stopMicBtn.style.display = 'none';
             cancelMicBtn.style.display = 'none';
             micVisualizer.classList.remove('active');
             statusDot.classList.remove('recording');
-            updateStatus('ready', 'Model ready!');
+            updateStatus('ready', 'Model available. Select audio to transcribe.');
         });
 
-        // Start
         initClient();
     </script>
 </body>

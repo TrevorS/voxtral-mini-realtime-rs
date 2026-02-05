@@ -153,7 +153,10 @@ Pure Rust implementation of Voxtral Mini 4B Realtime using the Burn ML framework
 | WebWorker | ✅ Complete | `web/worker.js` for off-main-thread inference |
 | VoxtralClient | ✅ Complete | `web/voxtral-client.js` high-level API |
 | Web Audio API | ✅ Complete | Microphone recording with MediaRecorder |
-| Quantization | 🔲 Pending | INT8/INT4 for model size |
+| Chunked loader API | ✅ Complete | `ModelLoader` class for streaming into WASM memory |
+| E2E browser tests | ✅ Complete | Playwright tests for WASM init, worker init |
+| 8GB model test | ⚠️ Blocked | wasm32 4GB limit prevents direct loading |
+| Quantization | 🔲 Required | INT4 (→2.2GB) needed to fit in wasm32 |
 
 ## Project Structure
 
@@ -415,7 +418,20 @@ The encoder uses standard RMSNorm. This contradicts an earlier note in this docu
     - Microphone recording with MediaRecorder
     - Automatic resampling to 16kHz
     - Recording timer and visualizer
-19. **NEXT: Model quantization for reduced WASM size**
+19. ~~Browser E2E tests~~ ✅ Complete
+    - `scripts/test_wasm_e2e.py` - Playwright-based WASM/worker tests
+    - `scripts/test_full_load.py` - Full model load test (discovered limits)
+20. ~~Chunked loader API~~ ✅ Complete
+    - `ModelLoader` class for streaming into WASM memory
+    - Bypasses JS ArrayBuffer limits (V8 ~4GB)
+21. **BLOCKER: wasm32 4GB address space**
+    - Full 8.86GB model cannot fit in wasm32 address space
+    - Browser streaming download works (8.86GB in 5.1s)
+    - Allocation fails in both JS and WASM memory
+22. **NEXT: INT4 quantization (REQUIRED)**
+    - Reduce 8.86GB → ~2.2GB to fit in wasm32
+    - May need GGUF or custom quantization
+    - Alternative: Server-side inference with browser UI
 
 ## Open Questions
 
@@ -436,9 +452,14 @@ The encoder uses standard RMSNorm. This contradicts an earlier note in this docu
    - Encoder: `mm_streams_embeddings.embedding_module.whisper_encoder.*`
    - Decoder: `layers.{N}.*`
 
-4. **WASM size**: 8.86GB model needs quantization for browser
-   - INT8: ~2.2GB, INT4: ~1.1GB
-   - May need dynamic quantization or progressive loading
+4. **WASM size**: 8.86GB model exceeds wasm32 4GB address space limit
+   - **JavaScript limit**: V8 can't allocate single ArrayBuffer > ~4GB
+   - **WASM32 limit**: 32-bit address space caps at 4GB total memory
+   - **Solutions tested**:
+     - Streaming download: ✅ Works (8.86GB in 5.1s)
+     - Single ArrayBuffer: ❌ "Array buffer allocation failed"
+     - WASM chunked loading: ❌ Can't allocate 8.86GB in wasm32
+   - **Required**: INT4 quantization (8.86GB → ~2.2GB) to fit in wasm32
 
 5. **Model outputs random multilingual tokens**: ✅ RESOLVED - See "Streaming Inference Findings" below
    - Root cause: Standard prefix (39 tokens) causes anomalous behavior at position 38

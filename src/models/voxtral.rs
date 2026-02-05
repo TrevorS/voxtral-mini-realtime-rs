@@ -409,6 +409,23 @@ impl<B: Backend> VoxtralModel<B> {
     pub fn create_decoder_cache(&self) -> LayerCaches<B> {
         self.decoder.create_cache()
     }
+
+    /// Decompose model into its parts (for quantization).
+    pub fn into_parts(
+        self,
+    ) -> (
+        AudioEncoder<B>,
+        LanguageModel<B>,
+        AudioLanguageAdapter<B>,
+        usize,
+    ) {
+        (
+            self.encoder,
+            self.decoder,
+            self.adapter,
+            self.reshape_factor,
+        )
+    }
 }
 
 #[cfg(test)]

@@ -46,6 +46,19 @@ impl VoxtralModelLoader {
 
     /// Load the complete VoxtralModel with pretrained weights.
     pub fn load<B: Backend>(&self, device: &B::Device) -> Result<VoxtralModel<B>> {
+        self.load_with_options(device, None)
+    }
+
+    /// Load with options for memory optimization.
+    ///
+    /// `max_vocab_size` truncates the embedding table to save memory.
+    /// For wasm32 deployment, use 32768 to save ~302 MB.
+    /// The model can only generate token IDs < max_vocab_size.
+    pub fn load_with_options<B: Backend>(
+        &self,
+        device: &B::Device,
+        max_vocab_size: Option<usize>,
+    ) -> Result<VoxtralModel<B>> {
         println!("Loading Voxtral model...");
 
         // Load encoder
@@ -58,7 +71,7 @@ impl VoxtralModelLoader {
 
         // Load decoder
         println!("  Loading language model (26 layers)...");
-        let decoder = self.load_decoder(device)?;
+        let decoder = self.load_decoder_with_vocab(device, max_vocab_size)?;
 
         println!("Model loaded successfully!");
 
@@ -66,7 +79,7 @@ impl VoxtralModelLoader {
     }
 
     /// Load the audio encoder with pretrained weights.
-    fn load_encoder<B: Backend>(&self, device: &B::Device) -> Result<AudioEncoder<B>> {
+    pub fn load_encoder<B: Backend>(&self, device: &B::Device) -> Result<AudioEncoder<B>> {
         use super::layers::RmsNorm;
         use super::weights::prefixes;
 
@@ -172,7 +185,7 @@ impl VoxtralModelLoader {
     }
 
     /// Load the audio-language adapter with pretrained weights.
-    fn load_adapter<B: Backend>(&self, device: &B::Device) -> Result<AudioLanguageAdapter<B>> {
+    pub fn load_adapter<B: Backend>(&self, device: &B::Device) -> Result<AudioLanguageAdapter<B>> {
         let names = adapter_weight_names();
 
         let linear1 = self.load_linear_without_bias(&names.linear1_weight, device)?;
@@ -180,14 +193,31 @@ impl VoxtralModelLoader {
 
         Ok(AudioLanguageAdapter::new(linear1, linear2))
     }
-
-    /// Load the language model decoder with pretrained weights.
-    fn load_decoder<B: Backend>(&self, device: &B::Device) -> Result<LanguageModel<B>> {
+    /// Load decoder with optional vocabulary truncation.
+    pub fn load_decoder_with_vocab<B: Backend>(
+        &self,
+        device: &B::Device,
+        max_vocab_size: Option<usize>,
+    ) -> Result<LanguageModel<B>> {
         let config = LanguageModelConfig::voxtral();
 
         // Load token embeddings
-        let tok_embeddings: Tensor<B, 2> =
+        let mut tok_embeddings: Tensor<B, 2> =
             load_tensor(&self.safetensors, prefixes::TOK_EMBEDDINGS, device)?;
+
+        // Truncate vocabulary if requested (saves memory for wasm32)
+        if let Some(max_vocab) = max_vocab_size {
+            let [full_vocab, d_model] = tok_embeddings.dims();
+            if max_vocab < full_vocab {
+                println!(
+                    "  Truncating vocabulary: {} -> {} tokens (saving {} MB)",
+                    full_vocab,
+                    max_vocab,
+                    (full_vocab - max_vocab) * d_model / 1_000_000
+                );
+                tok_embeddings = tok_embeddings.slice([0..max_vocab, 0..d_model]);
+            }
+        }
 
         // Load RoPE (computed, not from weights)
         let rope = RoPEConfig::new(config.head_dim, config.max_seq_len)
@@ -215,7 +245,7 @@ impl VoxtralModelLoader {
     }
 
     /// Load a single decoder layer with pretrained weights.
-    fn load_decoder_layer<B: Backend>(
+    pub fn load_decoder_layer<B: Backend>(
         &self,
         layer_idx: usize,
         config: &LanguageModelConfig,
@@ -272,6 +302,42 @@ impl VoxtralModelLoader {
         ))
     }
 
+    /// Load just the token embeddings from safetensors.
+    ///
+    /// Returns a Burn `Embedding` module with the pretrained weight.
+    pub fn load_tok_embeddings<B: Backend>(
+        &self,
+        device: &B::Device,
+    ) -> Result<burn::nn::Embedding<B>> {
+        use super::weights::prefixes;
+
+        let weight: Tensor<B, 2> =
+            load_tensor(&self.safetensors, prefixes::TOK_EMBEDDINGS, device)?;
+        Ok(burn::nn::Embedding {
+            weight: Param::initialized(ParamId::new(), weight),
+        })
+    }
+
+    /// Load just the final RMS normalization from safetensors.
+    ///
+    /// Returns the custom `RmsNorm` wrapper with the pretrained weight.
+    pub fn load_final_norm<B: Backend>(
+        &self,
+        device: &B::Device,
+    ) -> Result<super::layers::RmsNorm<B>> {
+        use super::layers::RmsNorm;
+        use super::weights::prefixes;
+
+        let config = LanguageModelConfig::voxtral();
+        let weight: Tensor<B, 1> = load_tensor(&self.safetensors, prefixes::FINAL_NORM, device)?;
+        Ok(RmsNorm {
+            weight: burn::nn::RmsNorm {
+                gamma: Param::initialized(ParamId::new(), weight),
+                epsilon: config.norm_eps,
+            },
+        })
+    }
+
     /// Load a Linear layer without bias.
     fn load_linear_without_bias<B: Backend>(
         &self,
@@ -280,6 +346,91 @@ impl VoxtralModelLoader {
     ) -> Result<Linear<B>> {
         let weight: Tensor<B, 2> = load_tensor(&self.safetensors, weight_name, device)?;
         Ok(linear_from_weights(weight, None))
+    }
+
+    // --- Static methods that accept borrowed SafeTensors (no Vec copy) ---
+
+    /// Load token embeddings directly from raw safetensors bytes.
+    ///
+    /// Uses `load_tensor_raw` to bypass `SafeTensors::deserialize`, which
+    /// overflows on wasm32 for the 402M-element embedding tensor.
+    pub fn tok_embeddings_from_raw<B: Backend>(
+        bytes: &[u8],
+        device: &B::Device,
+    ) -> Result<burn::nn::Embedding<B>> {
+        use super::weights::{load_tensor_raw, prefixes};
+
+        let weight: Tensor<B, 2> = load_tensor_raw(bytes, prefixes::TOK_EMBEDDINGS, device)?;
+        Ok(burn::nn::Embedding {
+            weight: Param::initialized(ParamId::new(), weight),
+        })
+    }
+
+    /// Load final norm from borrowed SafeTensors bytes.
+    pub fn final_norm_from_st<B: Backend>(
+        st: &safetensors::SafeTensors,
+        device: &B::Device,
+    ) -> Result<super::layers::RmsNorm<B>> {
+        use super::layers::RmsNorm;
+        use super::weights::prefixes;
+
+        let config = LanguageModelConfig::voxtral();
+        let weight: Tensor<B, 1> = load_tensor(st, prefixes::FINAL_NORM, device)?;
+        Ok(RmsNorm {
+            weight: burn::nn::RmsNorm {
+                gamma: Param::initialized(ParamId::new(), weight),
+                epsilon: config.norm_eps,
+            },
+        })
+    }
+
+    /// Load a single decoder layer from borrowed SafeTensors bytes.
+    pub fn decoder_layer_from_st<B: Backend>(
+        st: &safetensors::SafeTensors,
+        layer_idx: usize,
+        config: &LanguageModelConfig,
+        device: &B::Device,
+    ) -> Result<DecoderLayer<B>> {
+        let names = decoder_layer_weight_names(layer_idx);
+
+        let ada_norm_down: Tensor<B, 2> = load_tensor(st, &names.ada_norm_down, device)?;
+        let ada_norm_up: Tensor<B, 2> = load_tensor(st, &names.ada_norm_up, device)?;
+        let attention_norm_weight: Tensor<B, 1> = load_tensor(st, &names.attention_norm, device)?;
+
+        let wq = linear_from_weights(load_tensor(st, &names.wq_weight, device)?, None);
+        let wk = linear_from_weights(load_tensor(st, &names.wk_weight, device)?, None);
+        let wv = linear_from_weights(load_tensor(st, &names.wv_weight, device)?, None);
+        let wo = linear_from_weights(load_tensor(st, &names.wo_weight, device)?, None);
+
+        let attention = Attention::new(
+            wq,
+            wk,
+            wv,
+            wo,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            config.sliding_window,
+        );
+
+        let ffn_norm_weight: Tensor<B, 1> = load_tensor(st, &names.ffn_norm, device)?;
+
+        let w1 = linear_from_weights(load_tensor(st, &names.w1_weight, device)?, None);
+        let w2 = linear_from_weights(load_tensor(st, &names.w2_weight, device)?, None);
+        let w3 = linear_from_weights(load_tensor(st, &names.w3_weight, device)?, None);
+
+        Ok(DecoderLayer::new(
+            ada_norm_down,
+            ada_norm_up,
+            attention_norm_weight,
+            attention,
+            ffn_norm_weight,
+            w1,
+            w2,
+            w3,
+            config.t_cond_dim,
+            config.norm_eps,
+        ))
     }
 
     /// Load a Linear layer with optional bias.

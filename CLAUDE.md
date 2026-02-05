@@ -91,7 +91,8 @@ mel [B, 128, T] → encoder [B, T/4, 1280] → reshape [B, T/16, 5120]
 ```toml
 wgpu    # Default GPU backend (WebGPU/Vulkan/Metal)
 cuda    # NVIDIA CUDA backend
-cpu     # CPU backend (ndarray)
+cpu     # CPU backend (ndarray) - opt-in for offline tooling only
+wasm    # WASM/browser support (WebGPU backend)
 cli     # CLI tools (clap, indicatif)
 hub     # HuggingFace Hub integration
 ```
