@@ -9,6 +9,8 @@
             --bg: #1a1a2e;
             --surface: #16213e;
             --primary: #e94560;
+            --primary-hover: #ff6b6b;
+            --success: #5cb85c;
             --text: #eaeaea;
             --text-muted: #888;
         }
@@ -73,6 +75,12 @@
         .status-dot.loading { background: #f0ad4e; }
         .status-dot.ready { background: #5cb85c; }
         .status-dot.error { background: #d9534f; }
+        .status-dot.recording { background: #d9534f; animation: pulse 1s infinite; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
 
         button {
             background: var(--primary);
@@ -82,16 +90,31 @@
             border-radius: 8px;
             font-size: 1rem;
             cursor: pointer;
-            transition: opacity 0.2s;
+            transition: background 0.2s;
+            margin-right: 0.5rem;
+            margin-bottom: 0.5rem;
         }
 
-        button:hover {
-            opacity: 0.9;
+        button:hover:not(:disabled) {
+            background: var(--primary-hover);
         }
 
         button:disabled {
             opacity: 0.5;
             cursor: not-allowed;
+        }
+
+        button.recording {
+            background: #d9534f;
+            animation: pulse 1s infinite;
+        }
+
+        button.secondary {
+            background: #444;
+        }
+
+        button.secondary:hover:not(:disabled) {
+            background: #555;
         }
 
         .file-input {
@@ -114,6 +137,11 @@
 
         .file-input label:hover {
             border-color: var(--primary);
+        }
+
+        .file-input label.loaded {
+            border-color: var(--success);
+            border-style: solid;
         }
 
         .transcription {
@@ -157,6 +185,70 @@
             padding: 0.1rem 0.3rem;
             border-radius: 4px;
         }
+
+        .input-row {
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+            margin-bottom: 1rem;
+        }
+
+        .input-group {
+            flex: 1;
+            min-width: 200px;
+        }
+
+        .input-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+
+        .mic-visualizer {
+            height: 40px;
+            background: #0d1117;
+            border-radius: 4px;
+            margin-bottom: 1rem;
+            display: none;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .mic-visualizer.active {
+            display: flex;
+        }
+
+        .mic-visualizer .bars {
+            display: flex;
+            gap: 3px;
+            height: 30px;
+            align-items: flex-end;
+        }
+
+        .mic-visualizer .bar {
+            width: 4px;
+            background: var(--primary);
+            border-radius: 2px;
+            animation: bar-bounce 0.5s ease-in-out infinite;
+        }
+
+        @keyframes bar-bounce {
+            0%, 100% { height: 10%; }
+            50% { height: 100%; }
+        }
+
+        .mic-visualizer .bar:nth-child(1) { animation-delay: 0s; }
+        .mic-visualizer .bar:nth-child(2) { animation-delay: 0.1s; }
+        .mic-visualizer .bar:nth-child(3) { animation-delay: 0.2s; }
+        .mic-visualizer .bar:nth-child(4) { animation-delay: 0.3s; }
+        .mic-visualizer .bar:nth-child(5) { animation-delay: 0.4s; }
+
+        .timer {
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 1.2rem;
+            margin-left: 1rem;
+        }
     </style>
 </head>
 <body>
@@ -173,13 +265,19 @@
             <div class="progress" id="progress-container" style="display: none;">
                 <div class="progress-bar" id="progress-bar"></div>
             </div>
-            <div class="file-input">
-                <input type="file" id="model-file" accept=".safetensors">
-                <label for="model-file">Load model weights (consolidated.safetensors)</label>
-            </div>
-            <div class="file-input">
-                <input type="file" id="tokenizer-file" accept=".json">
-                <label for="tokenizer-file">Load tokenizer (tekken.json)</label>
+            <div class="input-row">
+                <div class="input-group">
+                    <div class="file-input">
+                        <input type="file" id="model-file" accept=".safetensors">
+                        <label for="model-file" id="model-label">Load model (consolidated.safetensors)</label>
+                    </div>
+                </div>
+                <div class="input-group">
+                    <div class="file-input">
+                        <input type="file" id="tokenizer-file" accept=".json">
+                        <label for="tokenizer-file" id="tokenizer-label">Load tokenizer (tekken.json)</label>
+                    </div>
+                </div>
             </div>
             <p class="info">
                 Model size: ~8GB. Download from
@@ -189,12 +287,32 @@
 
         <div class="card">
             <h2>Audio Input</h2>
+
+            <div class="mic-visualizer" id="mic-visualizer">
+                <div class="bars">
+                    <div class="bar"></div>
+                    <div class="bar"></div>
+                    <div class="bar"></div>
+                    <div class="bar"></div>
+                    <div class="bar"></div>
+                </div>
+                <span class="timer" id="rec-timer">0:00</span>
+            </div>
+
+            <div style="margin-bottom: 1rem;">
+                <button id="mic-btn" disabled>Start Microphone</button>
+                <button id="stop-mic-btn" class="secondary" style="display: none;">Stop & Transcribe</button>
+                <button id="cancel-mic-btn" class="secondary" style="display: none;">Cancel</button>
+            </div>
+
+            <div style="margin-bottom: 1rem; color: var(--text-muted);">— or —</div>
+
             <div class="file-input">
-                <input type="file" id="audio-file" accept=".wav">
-                <label for="audio-file">Select WAV file (16kHz mono)</label>
+                <input type="file" id="audio-file" accept="audio/*">
+                <label for="audio-file">Select audio file</label>
             </div>
             <p id="audio-info" class="info"></p>
-            <button id="transcribe-btn" disabled>Transcribe</button>
+            <button id="transcribe-btn" disabled>Transcribe File</button>
         </div>
 
         <div class="card">
@@ -206,37 +324,62 @@
     </div>
 
     <script type="module">
-        import init, { Voxtral } from '../pkg/voxtral_mini_realtime.js';
+        import { VoxtralClient } from './voxtral-client.js';
 
-        let voxtral = null;
-        let modelBytes = null;
-        let tokenizerJson = null;
-        let audioData = null;
+        const client = new VoxtralClient();
 
+        // UI elements
         const statusDot = document.getElementById('status-dot');
         const statusText = document.getElementById('status-text');
         const progressContainer = document.getElementById('progress-container');
         const progressBar = document.getElementById('progress-bar');
-        const transcribeBtn = document.getElementById('transcribe-btn');
         const transcriptionEl = document.getElementById('transcription');
         const audioInfo = document.getElementById('audio-info');
+        const modelLabel = document.getElementById('model-label');
+        const tokenizerLabel = document.getElementById('tokenizer-label');
+
+        // Buttons
+        const micBtn = document.getElementById('mic-btn');
+        const stopMicBtn = document.getElementById('stop-mic-btn');
+        const cancelMicBtn = document.getElementById('cancel-mic-btn');
+        const transcribeBtn = document.getElementById('transcribe-btn');
+
+        // Mic UI
+        const micVisualizer = document.getElementById('mic-visualizer');
+        const recTimer = document.getElementById('rec-timer');
+
+        // State
+        let modelBytes = null;
+        let tokenizerJson = null;
+        let audioFile = null;
+        let recStartTime = null;
+        let recTimerInterval = null;
 
         function updateStatus(status, text) {
             statusDot.className = 'status-dot ' + status;
             statusText.textContent = text;
         }
 
-        function updateTranscribeButton() {
-            transcribeBtn.disabled = !(voxtral?.isReady() && audioData);
+        function updateButtons() {
+            const ready = client.isReady();
+            micBtn.disabled = !ready;
+            transcribeBtn.disabled = !(ready && audioFile);
         }
 
-        // Initialize WASM
-        async function initWasm() {
+        // Progress callback
+        client.setProgressCallback((stage, percent) => {
+            updateStatus('loading', stage);
+            if (percent !== undefined) {
+                progressBar.style.width = percent + '%';
+            }
+        });
+
+        // Initialize client
+        async function initClient() {
             try {
                 updateStatus('loading', 'Initializing WASM...');
-                await init();
-                voxtral = new Voxtral();
-                updateStatus('', 'WASM ready. Load model files.');
+                await client.init();
+                updateStatus('', 'Ready. Load model files.');
             } catch (e) {
                 updateStatus('error', 'Failed to initialize: ' + e.message);
                 console.error(e);
@@ -260,6 +403,8 @@
                 };
                 reader.onload = async () => {
                     modelBytes = new Uint8Array(reader.result);
+                    modelLabel.classList.add('loaded');
+                    modelLabel.textContent = `Model loaded (${(file.size / 1e9).toFixed(2)} GB)`;
                     progressContainer.style.display = 'none';
 
                     if (modelBytes && tokenizerJson) {
@@ -282,6 +427,8 @@
 
             try {
                 tokenizerJson = await file.text();
+                tokenizerLabel.classList.add('loaded');
+                tokenizerLabel.textContent = 'Tokenizer loaded';
 
                 if (modelBytes && tokenizerJson) {
                     await loadModel();
@@ -297,9 +444,9 @@
         async function loadModel() {
             updateStatus('loading', 'Initializing model...');
             try {
-                voxtral.loadModel(modelBytes, tokenizerJson);
+                await client.loadModel(modelBytes, tokenizerJson);
                 updateStatus('ready', 'Model ready!');
-                updateTranscribeButton();
+                updateButtons();
             } catch (e) {
                 updateStatus('error', 'Failed to initialize model: ' + e.message);
                 console.error(e);
@@ -308,38 +455,29 @@
 
         // Load audio file
         document.getElementById('audio-file').addEventListener('change', async (e) => {
-            const file = e.target.files[0];
-            if (!file) return;
+            audioFile = e.target.files[0];
+            if (!audioFile) return;
 
             try {
-                const arrayBuffer = await file.arrayBuffer();
-                const audioContext = new AudioContext({ sampleRate: 16000 });
-                const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-
-                // Get mono channel
-                audioData = audioBuffer.getChannelData(0);
-
-                audioInfo.textContent = `Duration: ${audioBuffer.duration.toFixed(2)}s, ` +
-                    `Sample rate: ${audioBuffer.sampleRate}Hz, ` +
-                    `Samples: ${audioData.length}`;
-
-                updateTranscribeButton();
+                // Get basic info
+                audioInfo.textContent = `File: ${audioFile.name} (${(audioFile.size / 1024).toFixed(1)} KB)`;
+                updateButtons();
             } catch (e) {
                 audioInfo.textContent = 'Failed to load audio: ' + e.message;
                 console.error(e);
             }
         });
 
-        // Transcribe
+        // Transcribe file
         transcribeBtn.addEventListener('click', async () => {
-            if (!voxtral?.isReady() || !audioData) return;
+            if (!client.isReady() || !audioFile) return;
 
             transcribeBtn.disabled = true;
             transcriptionEl.textContent = 'Transcribing...';
             transcriptionEl.classList.add('empty');
 
             try {
-                const text = voxtral.transcribe(audioData);
+                const text = await client.transcribeFile(audioFile);
                 transcriptionEl.textContent = text || '(No speech detected)';
                 transcriptionEl.classList.remove('empty');
             } catch (e) {
@@ -350,8 +488,82 @@
             }
         });
 
+        // Microphone recording
+        function updateRecTimer() {
+            if (!recStartTime) return;
+            const elapsed = Math.floor((Date.now() - recStartTime) / 1000);
+            const mins = Math.floor(elapsed / 60);
+            const secs = elapsed % 60;
+            recTimer.textContent = `${mins}:${secs.toString().padStart(2, '0')}`;
+        }
+
+        micBtn.addEventListener('click', async () => {
+            try {
+                await client.startMicrophone();
+
+                // Update UI
+                micBtn.style.display = 'none';
+                stopMicBtn.style.display = '';
+                cancelMicBtn.style.display = '';
+                micVisualizer.classList.add('active');
+                statusDot.classList.add('recording');
+
+                // Start timer
+                recStartTime = Date.now();
+                recTimerInterval = setInterval(updateRecTimer, 1000);
+                updateRecTimer();
+
+            } catch (e) {
+                updateStatus('error', 'Microphone error: ' + e.message);
+                console.error(e);
+            }
+        });
+
+        stopMicBtn.addEventListener('click', async () => {
+            // Stop timer
+            clearInterval(recTimerInterval);
+            recTimerInterval = null;
+
+            // Update UI
+            micBtn.style.display = '';
+            stopMicBtn.style.display = 'none';
+            cancelMicBtn.style.display = 'none';
+            micVisualizer.classList.remove('active');
+            statusDot.classList.remove('recording');
+
+            transcriptionEl.textContent = 'Transcribing...';
+            transcriptionEl.classList.add('empty');
+
+            try {
+                const text = await client.stopAndTranscribe();
+                transcriptionEl.textContent = text || '(No speech detected)';
+                transcriptionEl.classList.remove('empty');
+                updateStatus('ready', 'Model ready!');
+            } catch (e) {
+                transcriptionEl.textContent = 'Error: ' + e.message;
+                updateStatus('error', 'Transcription failed');
+                console.error(e);
+            }
+        });
+
+        cancelMicBtn.addEventListener('click', () => {
+            client.cancelMicrophone();
+
+            // Stop timer
+            clearInterval(recTimerInterval);
+            recTimerInterval = null;
+
+            // Update UI
+            micBtn.style.display = '';
+            stopMicBtn.style.display = 'none';
+            cancelMicBtn.style.display = 'none';
+            micVisualizer.classList.remove('active');
+            statusDot.classList.remove('recording');
+            updateStatus('ready', 'Model ready!');
+        });
+
         // Start
-        initWasm();
+        initClient();
     </script>
 </body>
 </html>

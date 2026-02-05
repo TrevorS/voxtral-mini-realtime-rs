@@ -1,12 +1,12 @@
-//! WASM bindings for Voxtral using ndarray (CPU) backend.
+//! WASM bindings for Voxtral using wgpu (WebGPU) backend.
 //!
-//! This module provides JavaScript-callable APIs using the NdArray backend,
-//! which works on all browsers without WebGPU support.
+//! This module provides JavaScript-callable APIs using the WGPU backend,
+//! which enables GPU acceleration in browsers with WebGPU support.
 
 #[cfg(target_family = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use burn::backend::ndarray::NdArray;
+use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::tensor::Tensor;
 
 use crate::audio::mel::{MelConfig, MelSpectrogram};
@@ -17,7 +17,7 @@ use crate::models::time_embedding::TimeEmbedding;
 use crate::models::voxtral::VoxtralModel;
 use crate::tokenizer::VoxtralTokenizer;
 
-type Backend = NdArray<f32>;
+type Backend = Wgpu<f32, i32>;
 
 /// Initialize panic hook for better error messages in browser console.
 #[cfg_attr(target_family = "wasm", wasm_bindgen(start))]
@@ -25,22 +25,23 @@ pub fn start() {
     console_error_panic_hook::set_once();
 }
 
-/// Voxtral transcription model for browser use.
+/// Voxtral transcription model for browser use with WebGPU acceleration.
 ///
 /// This class wraps the full Voxtral model and provides a simple API
-/// for transcribing audio in the browser.
+/// for transcribing audio in the browser using GPU acceleration.
 #[cfg_attr(target_family = "wasm", wasm_bindgen)]
-pub struct Voxtral {
+pub struct VoxtralGpu {
     model: Option<VoxtralModel<Backend>>,
     tokenizer: Option<VoxtralTokenizer>,
     mel_extractor: MelSpectrogram,
     pad_config: PadConfig,
     time_embed: TimeEmbedding,
+    device: WgpuDevice,
 }
 
 #[cfg_attr(target_family = "wasm", wasm_bindgen)]
-impl Voxtral {
-    /// Create a new Voxtral instance.
+impl VoxtralGpu {
+    /// Create a new VoxtralGpu instance.
     ///
     /// Call `loadModel` to load weights before transcribing.
     #[cfg_attr(target_family = "wasm", wasm_bindgen(constructor))]
@@ -52,6 +53,7 @@ impl Voxtral {
             mel_extractor: MelSpectrogram::new(MelConfig::voxtral()),
             pad_config: PadConfig::voxtral(),
             time_embed: TimeEmbedding::new(3072),
+            device: WgpuDevice::default(),
         }
     }
 
@@ -69,13 +71,12 @@ impl Voxtral {
         );
 
         // Load model from bytes
-        let device = Default::default();
         let loader = VoxtralModelLoader::from_bytes(model_bytes.to_vec())
             .map_err(|e| format!("Failed to create model loader: {}", e))?;
 
         self.model = Some(
             loader
-                .load::<Backend>(&device)
+                .load::<Backend>(&self.device)
                 .map_err(|e| format!("Failed to load model: {}", e))?,
         );
 
@@ -106,8 +107,6 @@ impl Voxtral {
             .as_ref()
             .ok_or("Tokenizer not loaded. Call loadModel first.")?;
 
-        let device = Default::default();
-
         // Create audio buffer (assumes 16kHz input)
         let audio_buf = AudioBuffer {
             samples: audio.to_vec(),
@@ -136,17 +135,17 @@ impl Voxtral {
         let mel_flat: Vec<f32> = mel_transposed.into_iter().flatten().collect();
         let mel_tensor: Tensor<Backend, 3> = Tensor::from_data(
             burn::tensor::TensorData::new(mel_flat, [1, n_mels, n_frames]),
-            &device,
+            &self.device,
         );
 
         // Run encoder
         let audio_embeds = model.encode_audio(mel_tensor);
 
         // Create time embedding (t=6 for 480ms delay)
-        let t_embed = self.time_embed.embed::<Backend>(6.0, &device);
+        let t_embed = self.time_embed.embed::<Backend>(6.0, &self.device);
 
         // Run transcription
-        let generated_tokens = self.transcribe_with_cache(model, audio_embeds, t_embed, &device);
+        let generated_tokens = self.transcribe_with_cache(model, audio_embeds, t_embed);
 
         // Filter control tokens and decode
         let text_tokens: Vec<u32> = generated_tokens
@@ -166,7 +165,6 @@ impl Voxtral {
         model: &VoxtralModel<Backend>,
         audio_embeds: Tensor<Backend, 3>,
         t_embed: Tensor<Backend, 3>,
-        device: &<Backend as burn::tensor::backend::Backend>::Device,
     ) -> Vec<i32> {
         use burn::prelude::ElementConversion;
         use burn::tensor::Int;
@@ -193,7 +191,7 @@ impl Voxtral {
         // Embed prefix tokens
         let prefix_tensor = Tensor::<Backend, 2, Int>::from_data(
             burn::tensor::TensorData::new(prefix.clone(), [1, PREFIX_LEN]),
-            device,
+            &self.device,
         );
         let prefix_text_embeds = model.decoder().embed_tokens(prefix_tensor);
 
@@ -225,7 +223,7 @@ impl Voxtral {
             let new_token = generated[pos - 1];
             let token_tensor = Tensor::<Backend, 2, Int>::from_data(
                 burn::tensor::TensorData::new(vec![new_token], [1, 1]),
-                device,
+                &self.device,
             );
             let text_embed = model.decoder().embed_tokens(token_tensor);
 
@@ -256,7 +254,7 @@ impl Voxtral {
     }
 }
 
-impl Default for Voxtral {
+impl Default for VoxtralGpu {
     fn default() -> Self {
         Self::new()
     }

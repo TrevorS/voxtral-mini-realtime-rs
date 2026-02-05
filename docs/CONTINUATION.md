@@ -148,10 +148,11 @@ Pure Rust implementation of Voxtral Mini 4B Realtime using the Burn ML framework
 | WASM feature flags | ✅ Complete | `wasm` (ndarray) and `wasm-wgpu` features |
 | wasm-bindgen bindings | ✅ Complete | `Voxtral` class with `loadModel()`, `transcribe()` |
 | Build script | ✅ Complete | `scripts/build-wasm.sh [ndarray|wgpu]` |
-| Demo HTML | ✅ Complete | `web/index.html` with file upload UI |
+| Demo HTML | ✅ Complete | `web/index.html` with file/mic input UI |
 | WASM build verified | ✅ Complete | 1.7MB pkg, compiles to wasm32-unknown-unknown |
-| Web Audio API | 🔲 Pending | Microphone input |
-| WebWorker | 🔲 Pending | Off-main-thread inference |
+| WebWorker | ✅ Complete | `web/worker.js` for off-main-thread inference |
+| VoxtralClient | ✅ Complete | `web/voxtral-client.js` high-level API |
+| Web Audio API | ✅ Complete | Microphone recording with MediaRecorder |
 | Quantization | 🔲 Pending | INT8/INT4 for model size |
 
 ## Project Structure
@@ -253,7 +254,27 @@ voxtral.loadModel(new Uint8Array(modelBytes), tokenizerJson);
 const text = voxtral.transcribe(audioData);
 ```
 
-See `web/index.html` for a complete demo.
+### Using VoxtralClient (Recommended)
+
+The `VoxtralClient` class handles WebWorker communication and microphone access:
+
+```javascript
+import { VoxtralClient } from './web/voxtral-client.js';
+
+const client = new VoxtralClient();
+await client.init();
+await client.loadModel(modelBytes, tokenizerJson);
+
+// Transcribe a file
+const text = await client.transcribeFile(audioFile);
+
+// Or record from microphone
+await client.startMicrophone();
+// ... user speaks ...
+const text = await client.stopAndTranscribe();
+```
+
+See `web/index.html` for a complete demo with UI.
 
 ## Getting Started
 
@@ -381,14 +402,20 @@ The encoder uses standard RMSNorm. This contradicts an earlier note in this docu
     - Audio must be left-padded to align with prefix tokens
 14. ~~KV cache optimization~~ ✅ O(n) inference with cached KV tensors
 15. ~~Test WGPU backend~~ ✅ Works (freedreno Vulkan fallback on ARM)
-16. ~~WASM/browser support~~ ✅ Basic infrastructure complete
+16. ~~WASM/browser support~~ ✅ Complete
     - `wasm` feature: ndarray backend for all browsers
     - `wasm-wgpu` feature: WebGPU backend for compatible browsers
     - wasm-bindgen bindings in `src/web/bindings.rs`
     - Build script: `scripts/build-wasm.sh`
     - Demo page: `web/index.html`
-17. **NEXT: WebWorker integration for non-blocking inference**
-18. Model quantization for reduced WASM size
+17. ~~WebWorker integration~~ ✅ Complete
+    - `web/worker.js` - off-main-thread inference
+    - `web/voxtral-client.js` - high-level browser API
+18. ~~Web Audio API~~ ✅ Complete
+    - Microphone recording with MediaRecorder
+    - Automatic resampling to 16kHz
+    - Recording timer and visualizer
+19. **NEXT: Model quantization for reduced WASM size**
 
 ## Open Questions
 
