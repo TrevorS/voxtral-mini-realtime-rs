@@ -34,6 +34,9 @@ pub mod audio;
 pub mod models;
 pub mod tokenizer;
 
+#[cfg(any(feature = "wasm", feature = "wasm-wgpu"))]
+pub mod web;
+
 #[cfg(feature = "hub")]
 pub mod hub;
 

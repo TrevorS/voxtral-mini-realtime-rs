@@ -7,7 +7,7 @@ license = "Apache-2.0"
 repository = "https://github.com/tstrieber/voxtral-mini-realtime-rs"
 
 [features]
-default = ["wgpu"]
+default = ["wgpu", "native-tokenizer"]
 wgpu = ["burn/wgpu"]
 cuda = ["burn/cuda"]
 # CPU backend - requires ARM fp16 or x86 - may not compile on all systems
@@ -16,13 +16,34 @@ cpu = ["burn/ndarray"]
 all-portable = ["wgpu", "cli", "hub"]
 cli = ["clap", "indicatif"]
 hub = ["hf-hub"]
+# Native tokenizer (has C dependencies, not WASM compatible)
+native-tokenizer = ["tokenizers"]
+# WASM/browser support - uses ndarray backend (CPU) or wgpu (WebGPU)
+wasm = [
+    "burn/ndarray",
+    "wasm-bindgen",
+    "wasm-bindgen-futures",
+    "js-sys",
+    "web-sys",
+    "console_error_panic_hook",
+    "getrandom/wasm_js",
+]
+wasm-wgpu = [
+    "burn/wgpu",
+    "wasm-bindgen",
+    "wasm-bindgen-futures",
+    "js-sys",
+    "web-sys",
+    "console_error_panic_hook",
+    "getrandom/wasm_js",
+]
 
 [dependencies]
 # Burn ML framework - latest version with backend selection via features
 burn = { version = "0.20", default-features = false, features = ["std", "autodiff"] }
 
-# Tokenization
-tokenizers = "*"
+# Tokenization (native only - has C dependencies)
+tokenizers = { version = "*", optional = true }
 base64 = "0.22"
 
 # Audio processing
@@ -57,6 +78,14 @@ half = "2.7"
 ndarray = "0.16"
 ndarray-npy = "0.9"
 
+# WASM support (optional)
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", features = ["console"], optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+getrandom = { version = "0.3", default-features = false, optional = true }
+
 [dev-dependencies]
 criterion = "*"
 approx = "*"
@@ -67,7 +96,16 @@ name = "voxtral-transcribe"
 path = "src/bin/transcribe.rs"
 required-features = ["cli"]
 
+# WASM library target
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [profile.release]
 lto = true
 codegen-units = 1
 opt-level = 3
+
+[profile.release-wasm]
+inherits = "release"
+# Optimize for size in WASM
+opt-level = "s"

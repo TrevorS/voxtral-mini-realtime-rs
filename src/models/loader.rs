@@ -36,6 +36,14 @@ impl VoxtralModelLoader {
         Ok(Self { safetensors })
     }
 
+    /// Create a new loader from raw SafeTensors bytes.
+    ///
+    /// This is useful for WASM where file access is not available.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        let safetensors = OwnedSafeTensors::from_bytes(bytes)?;
+        Ok(Self { safetensors })
+    }
+
     /// Load the complete VoxtralModel with pretrained weights.
     pub fn load<B: Backend>(&self, device: &B::Device) -> Result<VoxtralModel<B>> {
         println!("Loading Voxtral model...");

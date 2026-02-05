@@ -119,6 +119,50 @@ impl VoxtralTokenizer {
         Self::from_file(path)
     }
 
+    /// Load tokenizer from a JSON string.
+    ///
+    /// This is useful for WASM where file access is not available.
+    pub fn from_json(json: &str) -> Result<Self> {
+        let tekken: TekkenJson =
+            serde_json::from_str(json).context("Failed to parse tekken JSON")?;
+
+        let vocab_size = tekken.config.default_vocab_size;
+
+        // Pre-allocate vocab_bytes indexed by vocab position
+        let mut vocab_bytes: Vec<Option<Vec<u8>>> = vec![None; tekken.vocab.len()];
+        let mut special_tokens = HashMap::new();
+
+        for (idx, entry) in tekken.vocab.iter().enumerate() {
+            // For control/special tokens, store separately
+            if entry.is_control {
+                if let Some(s) = &entry.token_str {
+                    // Special tokens use their rank directly as token ID (0-999 range)
+                    special_tokens.insert(entry.rank, s.clone());
+                }
+                continue;
+            }
+
+            // Decode token bytes from base64 if present
+            if let Some(b64) = &entry.token_bytes {
+                if let Ok(bytes) = BASE64_STANDARD.decode(b64) {
+                    vocab_bytes[idx] = Some(bytes);
+                    continue;
+                }
+            }
+
+            // Fall back to UTF-8 encoding of token_str if present
+            if let Some(s) = &entry.token_str {
+                vocab_bytes[idx] = Some(s.as_bytes().to_vec());
+            }
+        }
+
+        Ok(Self {
+            vocab_bytes,
+            special_tokens,
+            vocab_size,
+        })
+    }
+
     /// Decode token IDs to text.
     ///
     /// Token IDs >= 1000 are text tokens (vocab_index = token_id - 1000).

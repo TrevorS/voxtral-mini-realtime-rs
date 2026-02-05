@@ -140,11 +140,16 @@ Pure Rust implementation of Voxtral Mini 4B Realtime using the Burn ML framework
 | Pure Rust pipeline | ✅ Complete | No Python dependencies for inference! |
 | KV cache streaming | ✅ Complete | O(n) inference with cached KV tensors |
 
-### Phase 6: Browser/WASM 🔲
+### Phase 6: Browser/WASM 🚧
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| WGPU backend | 🔲 Pending | Test with CPU fallback |
+| WGPU backend | ✅ Complete | Tested on native, freedreno Vulkan fallback works |
+| WASM feature flags | ✅ Complete | `wasm` (ndarray) and `wasm-wgpu` features |
+| wasm-bindgen bindings | ✅ Complete | `Voxtral` class with `loadModel()`, `transcribe()` |
+| Build script | ✅ Complete | `scripts/build-wasm.sh [ndarray|wgpu]` |
+| Demo HTML | ✅ Complete | `web/index.html` with file upload UI |
+| WASM build verified | ✅ Complete | 1.7MB pkg, compiles to wasm32-unknown-unknown |
 | Web Audio API | 🔲 Pending | Microphone input |
 | WebWorker | 🔲 Pending | Off-main-thread inference |
 | Quantization | 🔲 Pending | INT8/INT4 for model size |
@@ -216,6 +221,39 @@ voxtral-mini-realtime-rs/
     ├── CONTINUATION.md          # This file
     └── VALIDATION.md            # Validation strategy
 ```
+
+## WASM/Browser Usage
+
+### Build WASM Package
+
+```bash
+# Build with ndarray (CPU) backend - works in all browsers
+./scripts/build-wasm.sh ndarray
+
+# Build with WebGPU backend - requires WebGPU-capable browser
+./scripts/build-wasm.sh wgpu
+```
+
+Output: `pkg/voxtral_mini_realtime.js` + `.wasm` (1.7MB)
+
+### Use in Browser
+
+```javascript
+import init, { Voxtral } from './pkg/voxtral_mini_realtime.js';
+
+await init();
+const voxtral = new Voxtral();
+
+// Load model (must be fetched separately - 8GB!)
+const modelBytes = await fetch('consolidated.safetensors').then(r => r.arrayBuffer());
+const tokenizerJson = await fetch('tekken.json').then(r => r.text());
+voxtral.loadModel(new Uint8Array(modelBytes), tokenizerJson);
+
+// Transcribe (16kHz mono Float32Array)
+const text = voxtral.transcribe(audioData);
+```
+
+See `web/index.html` for a complete demo.
 
 ## Getting Started
 
@@ -342,8 +380,15 @@ The encoder uses standard RMSNorm. This contradicts an earlier note in this docu
     - Fixed tokenizer: text token IDs = vocab_index + 1000
     - Audio must be left-padded to align with prefix tokens
 14. ~~KV cache optimization~~ ✅ O(n) inference with cached KV tensors
-15. **NEXT: Test WGPU backend**
-16. WASM/browser support
+15. ~~Test WGPU backend~~ ✅ Works (freedreno Vulkan fallback on ARM)
+16. ~~WASM/browser support~~ ✅ Basic infrastructure complete
+    - `wasm` feature: ndarray backend for all browsers
+    - `wasm-wgpu` feature: WebGPU backend for compatible browsers
+    - wasm-bindgen bindings in `src/web/bindings.rs`
+    - Build script: `scripts/build-wasm.sh`
+    - Demo page: `web/index.html`
+17. **NEXT: WebWorker integration for non-blocking inference**
+18. Model quantization for reduced WASM size
 
 ## Open Questions
 

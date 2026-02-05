@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voxtral Mini 4B Realtime - Browser Demo</title>
+    <style>
+        :root {
+            --bg: #1a1a2e;
+            --surface: #16213e;
+            --primary: #e94560;
+            --text: #eaeaea;
+            --text-muted: #888;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            margin: 0;
+            padding: 2rem;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            color: var(--primary);
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            color: var(--text-muted);
+            margin-bottom: 2rem;
+        }
+
+        .card {
+            background: var(--surface);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .card h2 {
+            margin-top: 0;
+            font-size: 1.1rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #666;
+        }
+
+        .status-dot.loading { background: #f0ad4e; }
+        .status-dot.ready { background: #5cb85c; }
+        .status-dot.error { background: #d9534f; }
+
+        button {
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        button:hover {
+            opacity: 0.9;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .file-input {
+            margin-bottom: 1rem;
+        }
+
+        .file-input input {
+            display: none;
+        }
+
+        .file-input label {
+            display: inline-block;
+            padding: 0.75rem 1.5rem;
+            background: var(--surface);
+            border: 2px dashed #444;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+
+        .file-input label:hover {
+            border-color: var(--primary);
+        }
+
+        .transcription {
+            background: #0d1117;
+            border-radius: 8px;
+            padding: 1rem;
+            min-height: 100px;
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 0.95rem;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+
+        .transcription.empty {
+            color: var(--text-muted);
+            font-style: italic;
+        }
+
+        .progress {
+            height: 4px;
+            background: #333;
+            border-radius: 2px;
+            overflow: hidden;
+            margin-bottom: 1rem;
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: var(--primary);
+            width: 0%;
+            transition: width 0.3s;
+        }
+
+        .info {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+
+        .info code {
+            background: #333;
+            padding: 0.1rem 0.3rem;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Voxtral Mini 4B Realtime</h1>
+        <p class="subtitle">Streaming ASR in the browser powered by Rust + WASM</p>
+
+        <div class="card">
+            <h2>Model Status</h2>
+            <div class="status">
+                <div class="status-dot" id="status-dot"></div>
+                <span id="status-text">Not loaded</span>
+            </div>
+            <div class="progress" id="progress-container" style="display: none;">
+                <div class="progress-bar" id="progress-bar"></div>
+            </div>
+            <div class="file-input">
+                <input type="file" id="model-file" accept=".safetensors">
+                <label for="model-file">Load model weights (consolidated.safetensors)</label>
+            </div>
+            <div class="file-input">
+                <input type="file" id="tokenizer-file" accept=".json">
+                <label for="tokenizer-file">Load tokenizer (tekken.json)</label>
+            </div>
+            <p class="info">
+                Model size: ~8GB. Download from
+                <code>mistralai/Voxtral-Mini-4B-Realtime-2602</code> on HuggingFace.
+            </p>
+        </div>
+
+        <div class="card">
+            <h2>Audio Input</h2>
+            <div class="file-input">
+                <input type="file" id="audio-file" accept=".wav">
+                <label for="audio-file">Select WAV file (16kHz mono)</label>
+            </div>
+            <p id="audio-info" class="info"></p>
+            <button id="transcribe-btn" disabled>Transcribe</button>
+        </div>
+
+        <div class="card">
+            <h2>Transcription</h2>
+            <div class="transcription empty" id="transcription">
+                Transcription will appear here...
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import init, { Voxtral } from '../pkg/voxtral_mini_realtime.js';
+
+        let voxtral = null;
+        let modelBytes = null;
+        let tokenizerJson = null;
+        let audioData = null;
+
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+        const progressContainer = document.getElementById('progress-container');
+        const progressBar = document.getElementById('progress-bar');
+        const transcribeBtn = document.getElementById('transcribe-btn');
+        const transcriptionEl = document.getElementById('transcription');
+        const audioInfo = document.getElementById('audio-info');
+
+        function updateStatus(status, text) {
+            statusDot.className = 'status-dot ' + status;
+            statusText.textContent = text;
+        }
+
+        function updateTranscribeButton() {
+            transcribeBtn.disabled = !(voxtral?.isReady() && audioData);
+        }
+
+        // Initialize WASM
+        async function initWasm() {
+            try {
+                updateStatus('loading', 'Initializing WASM...');
+                await init();
+                voxtral = new Voxtral();
+                updateStatus('', 'WASM ready. Load model files.');
+            } catch (e) {
+                updateStatus('error', 'Failed to initialize: ' + e.message);
+                console.error(e);
+            }
+        }
+
+        // Load model file
+        document.getElementById('model-file').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            updateStatus('loading', 'Loading model weights...');
+            progressContainer.style.display = 'block';
+
+            try {
+                const reader = new FileReader();
+                reader.onprogress = (e) => {
+                    if (e.lengthComputable) {
+                        progressBar.style.width = (e.loaded / e.total * 100) + '%';
+                    }
+                };
+                reader.onload = async () => {
+                    modelBytes = new Uint8Array(reader.result);
+                    progressContainer.style.display = 'none';
+
+                    if (modelBytes && tokenizerJson) {
+                        await loadModel();
+                    } else {
+                        updateStatus('', 'Model loaded. Now load tokenizer.');
+                    }
+                };
+                reader.readAsArrayBuffer(file);
+            } catch (e) {
+                updateStatus('error', 'Failed to load model: ' + e.message);
+                console.error(e);
+            }
+        });
+
+        // Load tokenizer file
+        document.getElementById('tokenizer-file').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            try {
+                tokenizerJson = await file.text();
+
+                if (modelBytes && tokenizerJson) {
+                    await loadModel();
+                } else {
+                    updateStatus('', 'Tokenizer loaded. Now load model.');
+                }
+            } catch (e) {
+                updateStatus('error', 'Failed to load tokenizer: ' + e.message);
+                console.error(e);
+            }
+        });
+
+        async function loadModel() {
+            updateStatus('loading', 'Initializing model...');
+            try {
+                voxtral.loadModel(modelBytes, tokenizerJson);
+                updateStatus('ready', 'Model ready!');
+                updateTranscribeButton();
+            } catch (e) {
+                updateStatus('error', 'Failed to initialize model: ' + e.message);
+                console.error(e);
+            }
+        }
+
+        // Load audio file
+        document.getElementById('audio-file').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            try {
+                const arrayBuffer = await file.arrayBuffer();
+                const audioContext = new AudioContext({ sampleRate: 16000 });
+                const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+                // Get mono channel
+                audioData = audioBuffer.getChannelData(0);
+
+                audioInfo.textContent = `Duration: ${audioBuffer.duration.toFixed(2)}s, ` +
+                    `Sample rate: ${audioBuffer.sampleRate}Hz, ` +
+                    `Samples: ${audioData.length}`;
+
+                updateTranscribeButton();
+            } catch (e) {
+                audioInfo.textContent = 'Failed to load audio: ' + e.message;
+                console.error(e);
+            }
+        });
+
+        // Transcribe
+        transcribeBtn.addEventListener('click', async () => {
+            if (!voxtral?.isReady() || !audioData) return;
+
+            transcribeBtn.disabled = true;
+            transcriptionEl.textContent = 'Transcribing...';
+            transcriptionEl.classList.add('empty');
+
+            try {
+                const text = voxtral.transcribe(audioData);
+                transcriptionEl.textContent = text || '(No speech detected)';
+                transcriptionEl.classList.remove('empty');
+            } catch (e) {
+                transcriptionEl.textContent = 'Error: ' + e.message;
+                console.error(e);
+            } finally {
+                transcribeBtn.disabled = false;
+            }
+        });
+
+        // Start
+        initWasm();
+    </script>
+</body>
+</html>
