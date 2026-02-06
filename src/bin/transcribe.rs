@@ -1,4 +1,4 @@
-//! CLI for Voxtral transcription.
+//! CLI for Voxtral transcription (f32 SafeTensors or Q4 GGUF).
 
 use anyhow::{bail, Context, Result};
 use burn::backend::Wgpu;
@@ -6,6 +6,8 @@ use burn::prelude::ElementConversion;
 use burn::tensor::Tensor;
 use clap::Parser;
 use std::path::PathBuf;
+use std::time::Instant;
+use tracing::info;
 
 use voxtral_mini_realtime::audio::{
     io::load_wav,
@@ -13,9 +15,7 @@ use voxtral_mini_realtime::audio::{
     pad::{pad_audio, PadConfig},
     resample::resample_to_16k,
 };
-use voxtral_mini_realtime::models::loader::VoxtralModelLoader;
 use voxtral_mini_realtime::models::time_embedding::TimeEmbedding;
-use voxtral_mini_realtime::models::voxtral::VoxtralModel;
 use voxtral_mini_realtime::tokenizer::VoxtralTokenizer;
 
 type Backend = Wgpu;
@@ -28,9 +28,17 @@ struct Cli {
     #[arg(short, long)]
     audio: String,
 
-    /// Path to model directory (containing consolidated.safetensors and tekken.json)
-    #[arg(short, long, default_value = "models/voxtral")]
+    /// Path to f32 model directory (containing consolidated.safetensors and tekken.json)
+    #[arg(short, long, default_value = "models/voxtral", conflicts_with = "gguf")]
     model: String,
+
+    /// Path to Q4 GGUF model file (use instead of --model for quantized inference)
+    #[arg(long, conflicts_with = "model", requires = "tokenizer")]
+    gguf: Option<String>,
+
+    /// Path to tokenizer JSON (defaults to <model>/tekken.json)
+    #[arg(long)]
+    tokenizer: Option<String>,
 
     /// Delay in tokens (1 token = 80ms)
     #[arg(short, long, default_value = "6")]
@@ -38,49 +46,37 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_target(false).init();
+
     let cli = Cli::parse();
     let device = Default::default();
 
-    let model_dir = PathBuf::from(&cli.model);
-    let safetensors_path = model_dir.join("consolidated.safetensors");
-    let tokenizer_path = model_dir.join("tekken.json");
-
-    if !safetensors_path.exists() {
-        bail!(
-            "Model not found at {}\nRun: hf download mistralai/Voxtral-Mini-4B-Realtime-2602 --local-dir {}",
-            safetensors_path.display(),
-            model_dir.display()
-        );
-    }
+    // Resolve tokenizer path
+    let tokenizer_path = match &cli.tokenizer {
+        Some(p) => PathBuf::from(p),
+        None => PathBuf::from(&cli.model).join("tekken.json"),
+    };
     if !tokenizer_path.exists() {
         bail!("Tokenizer not found at {}", tokenizer_path.display());
     }
 
-    // Load tokenizer
-    eprintln!("Loading tokenizer...");
+    info!("Loading tokenizer from {}", tokenizer_path.display());
     let tokenizer =
         VoxtralTokenizer::from_file(&tokenizer_path).context("Failed to load tokenizer")?;
 
-    // Load model
-    eprintln!("Loading model...");
-    let loader =
-        VoxtralModelLoader::from_file(&safetensors_path).context("Failed to open model weights")?;
-    let model = loader
-        .load::<Backend>(&device)
-        .context("Failed to load model")?;
-
     // Load and preprocess audio
-    eprintln!("Loading audio: {}", cli.audio);
+    let start = Instant::now();
+    info!(path = %cli.audio, "Loading audio");
     let audio = load_wav(&cli.audio).context("Failed to load audio")?;
-    eprintln!(
-        "  {:.2}s, {} Hz, {} samples",
-        audio.duration_secs(),
-        audio.sample_rate,
-        audio.samples.len()
+    info!(
+        duration_secs = format!("{:.2}", audio.duration_secs()),
+        sample_rate = audio.sample_rate,
+        samples = audio.samples.len(),
+        "Audio loaded"
     );
 
     let audio = if audio.sample_rate != 16000 {
-        eprintln!("  Resampling to 16 kHz...");
+        info!("Resampling to 16 kHz");
         resample_to_16k(&audio).context("Failed to resample audio")?
     } else {
         audio
@@ -98,7 +94,7 @@ fn main() -> Result<()> {
     if n_frames == 0 {
         bail!("Audio too short to produce mel frames");
     }
-    eprintln!("  Mel: {} frames x {} bins", n_frames, n_mels);
+    info!(frames = n_frames, bins = n_mels, "Mel spectrogram computed");
 
     // Transpose to [n_mels, n_frames] and build tensor
     let mut mel_transposed = vec![vec![0.0f32; n_frames]; n_mels];
@@ -112,20 +108,21 @@ fn main() -> Result<()> {
         burn::tensor::TensorData::new(mel_flat, [1, n_mels, n_frames]),
         &device,
     );
-
-    // Encode audio
-    eprintln!("Encoding audio...");
-    let audio_embeds = model.encode_audio(mel_tensor);
-    let seq_len = audio_embeds.dims()[1];
-    eprintln!("  {} audio tokens", seq_len);
+    info!(
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "Audio preprocessing complete"
+    );
 
     // Time embedding
     let time_embed = TimeEmbedding::new(3072);
     let t_embed = time_embed.embed::<Backend>(cli.delay as f32, &device);
 
-    // Decode
-    eprintln!("Decoding...");
-    let generated = transcribe_with_cache(&model, audio_embeds, t_embed, &device);
+    // Dispatch to f32 or Q4 path
+    let generated = if let Some(gguf_path) = &cli.gguf {
+        transcribe_q4(gguf_path, mel_tensor, t_embed, &device)?
+    } else {
+        transcribe_f32(&cli.model, mel_tensor, t_embed, &device)?
+    };
 
     // Filter control tokens and decode to text
     let text_tokens: Vec<u32> = generated
@@ -142,37 +139,64 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Autoregressive transcription with KV cache.
-fn transcribe_with_cache(
-    model: &VoxtralModel<Backend>,
-    audio_embeds: Tensor<Backend, 3>,
+/// f32 SafeTensors inference path.
+fn transcribe_f32(
+    model_dir: &str,
+    mel_tensor: Tensor<Backend, 3>,
     t_embed: Tensor<Backend, 3>,
     device: &<Backend as burn::tensor::backend::Backend>::Device,
-) -> Vec<i32> {
+) -> Result<Vec<i32>> {
     use burn::tensor::Int;
+    use voxtral_mini_realtime::models::loader::VoxtralModelLoader;
+    use voxtral_mini_realtime::models::voxtral::VoxtralModel;
 
+    let model_dir = PathBuf::from(model_dir);
+    let safetensors_path = model_dir.join("consolidated.safetensors");
+
+    if !safetensors_path.exists() {
+        bail!(
+            "Model not found at {}\nRun: hf download mistralai/Voxtral-Mini-4B-Realtime-2602 --local-dir {}",
+            safetensors_path.display(),
+            model_dir.display()
+        );
+    }
+
+    let start = Instant::now();
+    info!("Loading f32 model");
+    let loader =
+        VoxtralModelLoader::from_file(&safetensors_path).context("Failed to open model weights")?;
+    let model: VoxtralModel<Backend> = loader.load(device).context("Failed to load model")?;
+    info!(
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "f32 model loaded"
+    );
+
+    let audio_embeds = model.encode_audio(mel_tensor);
     let seq_len = audio_embeds.dims()[1];
     let d_model = audio_embeds.dims()[2];
+    info!(tokens = seq_len, "Audio encoded");
+
+    let start = Instant::now();
+    info!("Decoding");
 
     const PREFIX_LEN: usize = 38;
     const BOS_TOKEN: i32 = 1;
     const STREAMING_PAD: i32 = 32;
 
     if seq_len < PREFIX_LEN {
-        eprintln!(
-            "Warning: audio too short ({} tokens, need {})",
-            seq_len, PREFIX_LEN
+        info!(
+            tokens = seq_len,
+            required = PREFIX_LEN,
+            "Audio too short for decoding"
         );
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut decoder_cache = model.create_decoder_cache();
 
-    // Build prefix: BOS + 37 STREAMING_PAD
     let mut prefix: Vec<i32> = vec![BOS_TOKEN];
     prefix.extend(std::iter::repeat_n(STREAMING_PAD, PREFIX_LEN - 1));
 
-    // Embed prefix tokens
     let prefix_tensor = Tensor::<Backend, 2, Int>::from_data(
         burn::tensor::TensorData::new(prefix.clone(), [1, PREFIX_LEN]),
         device,
@@ -223,5 +247,46 @@ fn transcribe_with_cache(
         generated.push(next_token);
     }
 
-    generated.into_iter().skip(PREFIX_LEN).collect()
+    info!(
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        tokens = generated.len() - PREFIX_LEN,
+        "Decoding complete"
+    );
+
+    Ok(generated.into_iter().skip(PREFIX_LEN).collect())
+}
+
+/// Q4 GGUF inference path.
+fn transcribe_q4(
+    gguf_path: &str,
+    mel_tensor: Tensor<Backend, 3>,
+    t_embed: Tensor<Backend, 3>,
+    device: &<Backend as burn::tensor::backend::Backend>::Device,
+) -> Result<Vec<i32>> {
+    use voxtral_mini_realtime::gguf::loader::Q4ModelLoader;
+
+    let path = PathBuf::from(gguf_path);
+    if !path.exists() {
+        bail!("GGUF model not found at {}", path.display());
+    }
+
+    let start = Instant::now();
+    info!("Loading Q4 GGUF model");
+    let mut loader = Q4ModelLoader::from_file(&path).context("Failed to open GGUF")?;
+    let model = loader.load(device).context("Failed to load Q4 model")?;
+    info!(
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "Q4 model loaded"
+    );
+
+    let start = Instant::now();
+    info!("Encoding + decoding");
+    let generated = model.transcribe_streaming(mel_tensor, t_embed);
+    info!(
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        tokens = generated.len(),
+        "Q4 inference complete"
+    );
+
+    Ok(generated)
 }

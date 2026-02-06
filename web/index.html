@@ -254,10 +254,10 @@
 <body>
     <div class="container">
         <h1>Voxtral Mini 4B Realtime</h1>
-        <p class="subtitle">Streaming ASR in the browser powered by Rust + WASM</p>
+        <p class="subtitle">Streaming ASR in the browser — Q4 GGUF + Rust + WASM + WebGPU</p>
 
         <div class="card">
-            <h2>Model Status</h2>
+            <h2>Model</h2>
             <div class="status">
                 <div class="status-dot" id="status-dot"></div>
                 <span id="status-text">Not loaded</span>
@@ -265,14 +265,27 @@
             <div class="progress" id="progress-container" style="display: none;">
                 <div class="progress-bar" id="progress-bar"></div>
             </div>
-            <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
-                <button id="load-btn" disabled>Load Model from Server</button>
-                <span id="cache-info" class="info"></span>
-                <button id="clear-cache-btn" class="secondary" style="display: none;">Clear Cache</button>
+
+            <div class="input-row">
+                <div class="input-group">
+                    <label for="gguf-file">GGUF Model (~2 GB)</label>
+                    <div class="file-input">
+                        <input type="file" id="gguf-file" accept=".gguf">
+                        <label for="gguf-file" id="gguf-label">Select .gguf file</label>
+                    </div>
+                </div>
+                <div class="input-group">
+                    <label for="tokenizer-file">Tokenizer JSON</label>
+                    <div class="file-input">
+                        <input type="file" id="tokenizer-file" accept=".json">
+                        <label for="tokenizer-file" id="tokenizer-label">Select tekken.json</label>
+                    </div>
+                </div>
             </div>
+            <button id="load-btn" disabled>Load from Files</button>
+            <button id="load-server-btn" disabled>Load from Server</button>
             <p class="info">
-                Shards are cached in the browser after first fetch.
-                Subsequent transcriptions load from cache instantly.
+                Pick local files or load pre-sharded model from the server.
             </p>
         </div>
 
@@ -319,17 +332,6 @@
 
         const client = new VoxtralClient();
 
-        // Server shard URLs
-        const SHARDS_BASE = '/models/shards-safetensors';
-        const TOKENIZER_URL = '/models/voxtral/tekken.json';
-        const serverUrls = {
-            tokenizer: TOKENIZER_URL,
-            encoder: `${SHARDS_BASE}/encoder.safetensors.gz`,
-            adapter: `${SHARDS_BASE}/adapter.safetensors.gz`,
-            manifest: `${SHARDS_BASE}/manifest.json`,
-            baseUrl: SHARDS_BASE,
-        };
-
         // UI elements
         const statusDot = document.getElementById('status-dot');
         const statusText = document.getElementById('status-text');
@@ -338,6 +340,12 @@
         const transcriptionEl = document.getElementById('transcription');
         const audioInfo = document.getElementById('audio-info');
         const loadBtn = document.getElementById('load-btn');
+
+        // Model file inputs
+        const ggufInput = document.getElementById('gguf-file');
+        const tokenizerInput = document.getElementById('tokenizer-file');
+        const ggufLabel = document.getElementById('gguf-label');
+        const tokenizerLabel = document.getElementById('tokenizer-label');
 
         // Buttons
         const micBtn = document.getElementById('mic-btn');
@@ -349,28 +357,9 @@
         const micVisualizer = document.getElementById('mic-visualizer');
         const recTimer = document.getElementById('rec-timer');
 
-        // Cache UI
-        const cacheInfo = document.getElementById('cache-info');
-        const clearCacheBtn = document.getElementById('clear-cache-btn');
-
-        async function updateCacheInfo() {
-            const count = await VoxtralClient.getCachedShardCount();
-            if (count > 0) {
-                cacheInfo.textContent = `(${count} shards cached)`;
-                clearCacheBtn.style.display = '';
-            } else {
-                cacheInfo.textContent = '';
-                clearCacheBtn.style.display = 'none';
-            }
-        }
-
-        clearCacheBtn.addEventListener('click', async () => {
-            await VoxtralClient.clearCache();
-            updateCacheInfo();
-        });
-
         // State
-        let serverReady = false;
+        let ggufFile = null;
+        let tokenizerFile = null;
         let audioFile = null;
         let recStartTime = null;
         let recTimerInterval = null;
@@ -380,9 +369,13 @@
             statusText.textContent = text;
         }
 
+        const loadServerBtn = document.getElementById('load-server-btn');
+
         function updateButtons() {
-            micBtn.disabled = !serverReady;
-            transcribeBtn.disabled = !(serverReady && audioFile);
+            loadBtn.disabled = !(client.ready && ggufFile && tokenizerFile && !client.modelLoaded);
+            loadServerBtn.disabled = !(client.ready && !client.modelLoaded);
+            micBtn.disabled = !client.isReady();
+            transcribeBtn.disabled = !(client.isReady() && audioFile);
         }
 
         // Progress callback
@@ -394,41 +387,85 @@
             }
         });
 
+        // Model file selection
+        ggufInput.addEventListener('change', (e) => {
+            ggufFile = e.target.files[0];
+            if (ggufFile) {
+                ggufLabel.textContent = ggufFile.name;
+                ggufLabel.classList.add('loaded');
+            }
+            updateButtons();
+        });
+
+        tokenizerInput.addEventListener('change', (e) => {
+            tokenizerFile = e.target.files[0];
+            if (tokenizerFile) {
+                tokenizerLabel.textContent = tokenizerFile.name;
+                tokenizerLabel.classList.add('loaded');
+            }
+            updateButtons();
+        });
+
         // Initialize WASM
         async function initClient() {
             try {
                 updateStatus('loading', 'Initializing WASM + WebGPU...');
                 await client.init();
-                updateStatus('', 'WASM ready. Click "Load Model from Server".');
-                loadBtn.disabled = false;
-                updateCacheInfo();
+                updateStatus('', 'WASM ready. Select model files to load.');
+                updateButtons();
             } catch (e) {
                 updateStatus('error', 'Failed to initialize: ' + e.message);
                 console.error(e);
             }
         }
 
-        // Load model from server (validates shards exist)
+        // Load model
         loadBtn.addEventListener('click', async () => {
+            if (!ggufFile || !tokenizerFile) return;
             loadBtn.disabled = true;
+
             try {
-                updateStatus('loading', 'Checking server for model shards...');
+                updateStatus('loading', 'Reading model files...');
+                progressContainer.style.display = 'block';
+                progressBar.style.width = '10%';
 
-                const manifestResp = await fetch(serverUrls.manifest);
-                if (!manifestResp.ok) throw new Error('Manifest not found on server');
-                const manifest = await manifestResp.json();
+                const [ggufBytes, tokenizerJson] = await Promise.all([
+                    ggufFile.arrayBuffer(),
+                    tokenizerFile.text(),
+                ]);
 
-                // Quick check that tokenizer is available
-                const tokResp = await fetch(serverUrls.tokenizer, { method: 'HEAD' });
-                if (!tokResp.ok) throw new Error('Tokenizer not found on server');
+                progressBar.style.width = '30%';
+                updateStatus('loading', 'Loading Q4 model into WebGPU...');
 
-                serverReady = true;
-                const sizeGB = (manifest.total_size / 1e9).toFixed(1);
-                updateStatus('ready', `Model available (${manifest.shards.length} shards, ${sizeGB} GB). Select audio to transcribe.`);
+                await client.loadModel(new Uint8Array(ggufBytes), tokenizerJson);
+
+                progressContainer.style.display = 'none';
+                updateStatus('ready', 'Model loaded. Select audio to transcribe.');
                 updateButtons();
             } catch (e) {
-                updateStatus('error', 'Server error: ' + e.message);
-                loadBtn.disabled = false;
+                updateStatus('error', 'Failed to load model: ' + e.message);
+                progressContainer.style.display = 'none';
+                updateButtons();
+                console.error(e);
+            }
+        });
+
+        // Load model from server (sharded)
+        loadServerBtn.addEventListener('click', async () => {
+            loadServerBtn.disabled = true;
+            loadBtn.disabled = true;
+
+            try {
+                progressContainer.style.display = 'block';
+                await client.loadFromServer();
+
+                progressContainer.style.display = 'none';
+                updateStatus('ready', 'Model loaded from server. Select audio to transcribe.');
+                updateButtons();
+            } catch (e) {
+                updateStatus('error', 'Failed to load model: ' + e.message);
+                progressContainer.style.display = 'none';
+                updateButtons();
                 console.error(e);
             }
         });
@@ -441,27 +478,23 @@
             updateButtons();
         });
 
-        // Transcribe file (phased pipeline)
+        // Transcribe file
         transcribeBtn.addEventListener('click', async () => {
-            if (!serverReady || !audioFile) return;
+            if (!client.isReady() || !audioFile) return;
 
             transcribeBtn.disabled = true;
             micBtn.disabled = true;
-            progressContainer.style.display = 'block';
-            transcriptionEl.textContent = 'Loading shards and transcribing...';
+            transcriptionEl.textContent = 'Transcribing...';
             transcriptionEl.classList.add('empty');
 
             try {
-                const text = await client.transcribeFilePhased(audioFile, serverUrls);
+                const text = await client.transcribeFile(audioFile);
                 transcriptionEl.textContent = text || '(No speech detected)';
                 transcriptionEl.classList.remove('empty');
-                progressContainer.style.display = 'none';
                 updateStatus('ready', 'Done! Select audio to transcribe again.');
-                updateCacheInfo();
             } catch (e) {
                 transcriptionEl.textContent = 'Error: ' + (e.message || String(e));
                 updateStatus('error', 'Transcription failed');
-                progressContainer.style.display = 'none';
                 console.error(e);
             } finally {
                 updateButtons();
@@ -506,21 +539,17 @@
             micVisualizer.classList.remove('active');
             statusDot.classList.remove('recording');
 
-            progressContainer.style.display = 'block';
-            transcriptionEl.textContent = 'Loading shards and transcribing...';
+            transcriptionEl.textContent = 'Transcribing...';
             transcriptionEl.classList.add('empty');
 
             try {
-                const text = await client.stopAndTranscribePhased(serverUrls);
+                const text = await client.stopAndTranscribe();
                 transcriptionEl.textContent = text || '(No speech detected)';
                 transcriptionEl.classList.remove('empty');
-                progressContainer.style.display = 'none';
                 updateStatus('ready', 'Done!');
-                updateCacheInfo();
             } catch (e) {
                 transcriptionEl.textContent = 'Error: ' + (e.message || String(e));
                 updateStatus('error', 'Transcription failed');
-                progressContainer.style.display = 'none';
                 console.error(e);
             } finally {
                 updateButtons();
@@ -538,7 +567,7 @@
             cancelMicBtn.style.display = 'none';
             micVisualizer.classList.remove('active');
             statusDot.classList.remove('recording');
-            updateStatus('ready', 'Model available. Select audio to transcribe.');
+            updateStatus('ready', 'Model loaded. Select audio to transcribe.');
         });
 
         initClient();

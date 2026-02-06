@@ -10,6 +10,7 @@ use burn::nn::Linear;
 use burn::prelude::Backend;
 use burn::tensor::Tensor;
 use std::path::Path;
+use tracing::info;
 
 use super::adapter::AudioLanguageAdapter;
 use super::decoder::{LanguageModel, LanguageModelConfig};
@@ -59,21 +60,18 @@ impl VoxtralModelLoader {
         device: &B::Device,
         max_vocab_size: Option<usize>,
     ) -> Result<VoxtralModel<B>> {
-        println!("Loading Voxtral model...");
+        info!("Loading Voxtral model");
 
-        // Load encoder
-        println!("  Loading audio encoder (32 layers)...");
+        info!(layers = 32, "Loading audio encoder");
         let encoder = self.load_encoder(device)?;
 
-        // Load adapter
-        println!("  Loading audio-language adapter...");
+        info!("Loading audio-language adapter");
         let adapter = self.load_adapter(device)?;
 
-        // Load decoder
-        println!("  Loading language model (26 layers)...");
+        info!(layers = 26, "Loading language model");
         let decoder = self.load_decoder_with_vocab(device, max_vocab_size)?;
 
-        println!("Model loaded successfully!");
+        info!("Model loaded");
 
         Ok(VoxtralModel::new(encoder, decoder, adapter, 4))
     }
@@ -209,11 +207,11 @@ impl VoxtralModelLoader {
         if let Some(max_vocab) = max_vocab_size {
             let [full_vocab, d_model] = tok_embeddings.dims();
             if max_vocab < full_vocab {
-                println!(
-                    "  Truncating vocabulary: {} -> {} tokens (saving {} MB)",
-                    full_vocab,
-                    max_vocab,
-                    (full_vocab - max_vocab) * d_model / 1_000_000
+                info!(
+                    from = full_vocab,
+                    to = max_vocab,
+                    saved_mb = (full_vocab - max_vocab) * d_model / 1_000_000,
+                    "Truncating vocabulary"
                 );
                 tok_embeddings = tok_embeddings.slice([0..max_vocab, 0..d_model]);
             }

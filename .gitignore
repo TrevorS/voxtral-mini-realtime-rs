@@ -3,6 +3,15 @@ Cargo.lock
 *.swp
 *.swo
 .DS_Store
+node_modules/
+bun.lock
+test-results/
+playwright-report/
+
+# Cargo registry metadata in patches
+patches/**/.cargo-ok
+patches/**/.cargo_vcs_info.json
+patches/**/Cargo.toml.orig
 
 # Model weights (too large for git)
 *.safetensors

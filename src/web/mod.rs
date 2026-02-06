@@ -1,16 +1,17 @@
-//! WASM/browser bindings for Voxtral Mini 4B Realtime.
+//! WASM/browser bindings for Voxtral Mini 4B Realtime (Q4 GGUF).
 //!
-//! This module provides JavaScript-callable APIs for GPU-accelerated audio
-//! transcription in the browser via WebGPU (wgpu backend).
+//! This module provides JavaScript-callable APIs for GPU-accelerated Q4
+//! inference in the browser via WebGPU (wgpu backend).
 //!
 //! ## Usage from JavaScript
 //!
 //! ```javascript
-//! import init, { Voxtral } from './pkg/voxtral_mini_realtime.js';
+//! import init, { VoxtralQ4, initWgpuDevice } from './pkg/voxtral_mini_realtime.js';
 //!
 //! await init();
-//! const voxtral = new Voxtral();
-//! await voxtral.loadModel(modelBytes);
+//! await initWgpuDevice();
+//! const voxtral = new VoxtralQ4();
+//! voxtral.loadModel(ggufBytes, tokenizerJson);
 //!
 //! // Transcribe audio (16kHz mono Float32Array)
 //! const text = await voxtral.transcribe(audioData);

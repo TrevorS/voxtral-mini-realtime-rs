@@ -9,18 +9,14 @@ repository = "https://github.com/tstrieber/voxtral-mini-realtime-rs"
 [features]
 default = ["wgpu", "native-tokenizer"]
 wgpu = ["burn/wgpu"]
-cuda = ["burn/cuda"]
-# CPU backend - requires ARM fp16 or x86 - may not compile on all systems
-cpu = ["burn/ndarray"]
-# All portable features for CI/testing (wgpu works everywhere with GPU)
-all-portable = ["wgpu", "cli", "hub"]
 cli = ["clap", "indicatif"]
 hub = ["hf-hub"]
 # Native tokenizer (has C dependencies, not WASM compatible)
 native-tokenizer = ["tokenizers"]
 # WASM/browser support - uses wgpu (WebGPU) backend for GPU inference
 wasm = [
-    "burn/wgpu",
+    "wgpu",
+    "dep:wgpu",
     "wasm-bindgen",
     "wasm-bindgen-futures",
     "js-sys",
@@ -31,7 +27,8 @@ wasm = [
 
 [dependencies]
 # Burn ML framework - latest version with backend selection via features
-burn = { version = "0.20", default-features = false, features = ["std", "autodiff"] }
+burn = { version = "0.20", default-features = false, features = ["std", "autodiff", "template"] }
+cubecl = { version = "0.9", default-features = false, features = ["wgpu"] }
 
 # Tokenization (native only - has C dependencies)
 tokenizers = { version = "*", optional = true }
@@ -77,6 +74,8 @@ js-sys = { version = "0.3", optional = true }
 web-sys = { version = "0.3", features = ["console"], optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 getrandom = { version = "0.3", default-features = false, optional = true }
+# Direct wgpu dep for custom device init (must match cubecl-wgpu's version)
+wgpu = { version = "26", features = ["fragile-send-sync-non-atomic-wasm"], optional = true }
 
 [dev-dependencies]
 criterion = "*"
@@ -87,21 +86,6 @@ tempfile = "*"
 name = "voxtral-transcribe"
 path = "src/bin/transcribe.rs"
 required-features = ["cli"]
-
-[[bin]]
-name = "shard_safetensors"
-path = "src/bin/shard_safetensors.rs"
-required-features = ["cli"]
-
-[[bin]]
-name = "quantize_model"
-path = "src/bin/quantize_model.rs"
-required-features = ["cli", "cpu"]
-
-[[bin]]
-name = "test_accuracy"
-path = "src/bin/test_accuracy.rs"
-required-features = ["cli", "cpu"]
 
 # WASM library target
 [lib]
@@ -116,3 +100,9 @@ opt-level = 3
 inherits = "release"
 # Optimize for size in WASM
 opt-level = "s"
+
+# Patch cubecl-wgpu to cap subgroup size workaround against WebGPU's
+# max_compute_invocations_per_workgroup (256). Without this, cubek-reduce
+# creates workgroups of 128*8=1024 which exceeds the WebGPU limit.
+[patch.crates-io]
+cubecl-wgpu = { path = "patches/cubecl-wgpu-0.9.0" }
