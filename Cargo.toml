@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Voxtral Mini 4B Realtime - Streaming ASR in Rust with Burn"
 license = "Apache-2.0"
-repository = "https://github.com/tstrieber/voxtral-mini-realtime-rs"
+repository = "https://github.com/TrevorS/voxtral-mini-realtime-rs"
 authors = ["Trevor Strieber"]
 
 [features]
