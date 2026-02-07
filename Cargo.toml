@@ -5,6 +5,7 @@ edition = "2021"
 description = "Voxtral Mini 4B Realtime - Streaming ASR in Rust with Burn"
 license = "Apache-2.0"
 repository = "https://github.com/tstrieber/voxtral-mini-realtime-rs"
+authors = ["Trevor Strieber"]
 
 [features]
 default = ["wgpu", "native-tokenizer"]
@@ -31,36 +32,36 @@ burn = { version = "0.20", default-features = false, features = ["std", "autodif
 cubecl = { version = "0.9", default-features = false, features = ["wgpu"] }
 
 # Tokenization (native only - has C dependencies)
-tokenizers = { version = "*", optional = true }
+tokenizers = { version = "0.22", optional = true }
 base64 = "0.22"
 
 # Audio processing
-hound = "*"                # WAV I/O
-rubato = "*"               # High-quality resampling
-rustfft = "*"              # FFT for spectrograms
-audioadapter-buffers = "*" # Buffer adapters for rubato
+hound = "3.5"              # WAV I/O
+rubato = "1.0"             # High-quality resampling
+rustfft = "6.4"            # FFT for spectrograms
+audioadapter-buffers = "2.0" # Buffer adapters for rubato
 
 # Serialization & model loading
-safetensors = "*"
-serde = { version = "*", features = ["derive"] }
-serde_json = "*"
+safetensors = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 # Utilities
-anyhow = "*"
-thiserror = "*"
-tracing = "*"
-tracing-subscriber = "*"
-num-traits = "*"
-num-complex = "*"
-byteorder = "*"
-flate2 = "*"
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+num-traits = "0.2"
+num-complex = "0.4"
+byteorder = "1.5"
+flate2 = "1.1"
 
 # CLI (optional)
-clap = { version = "*", features = ["derive"], optional = true }
-indicatif = { version = "*", optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+indicatif = { version = "0.18", optional = true }
 
 # HuggingFace Hub (optional)
-hf-hub = { version = "*", default-features = false, features = ["ureq"], optional = true }
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
 half = "2.7"
 
 # NDArray for test data loading (used by test binary too)
@@ -78,9 +79,9 @@ getrandom = { version = "0.3", default-features = false, optional = true }
 wgpu = { version = "26", features = ["fragile-send-sync-non-atomic-wasm"], optional = true }
 
 [dev-dependencies]
-criterion = "*"
-approx = "*"
-tempfile = "*"
+criterion = "0.8"
+approx = "0.5"
+tempfile = "3.24"
 
 [[bin]]
 name = "voxtral-transcribe"

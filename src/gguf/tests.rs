@@ -477,6 +477,168 @@ mod tests {
         }
     }
 
+    // =========================================================================
+    // Q4Linear tests
+    // =========================================================================
+
+    #[test]
+    fn test_q4_linear_forward_shape() {
+        let device = Default::default();
+
+        let in_features = 128;
+        let out_features = 64;
+
+        let weight_data: Vec<f32> = (0..out_features * in_features)
+            .map(|i| ((i as f32) * 0.001).sin() * 0.1)
+            .collect();
+        let q4_bytes = quantize_f32_to_q4_0(&weight_data);
+
+        let q4_tensor = Q4Tensor::from_q4_bytes(&q4_bytes, [out_features, in_features], &device)
+            .expect("Failed to create Q4Tensor");
+        let linear = Q4Linear::new(q4_tensor, None);
+
+        let input = Tensor::<TestBackend, 3>::zeros([2, 5, in_features], &device);
+        let output = linear.forward(input);
+
+        assert_eq!(output.dims(), [2, 5, out_features]);
+    }
+
+    #[test]
+    fn test_q4_linear_forward_with_bias() {
+        let device = Default::default();
+
+        let in_features = 64;
+        let out_features = 32;
+
+        let weight_data: Vec<f32> = (0..out_features * in_features)
+            .map(|i| ((i as f32) * 0.001).sin() * 0.1)
+            .collect();
+        let q4_bytes = quantize_f32_to_q4_0(&weight_data);
+        let weight_deq = dequantize_q4_0_to_f32(&q4_bytes, out_features * in_features);
+
+        // Create bias
+        let bias_data: Vec<f32> = (0..out_features).map(|i| i as f32 * 0.01).collect();
+        let bias = Tensor::<TestBackend, 1>::from_data(
+            TensorData::new(bias_data.clone(), [out_features]),
+            &device,
+        );
+
+        let q4_tensor = Q4Tensor::from_q4_bytes(&q4_bytes, [out_features, in_features], &device)
+            .expect("Failed to create Q4Tensor");
+        let linear = Q4Linear::new(q4_tensor, Some(bias));
+
+        // Input
+        let act_data: Vec<f32> = (0..in_features).map(|i| (i as f32) * 0.1).collect();
+        let input = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(act_data.clone(), [1, 1, in_features]),
+            &device,
+        );
+        let output = linear.forward(input);
+
+        assert_eq!(output.dims(), [1, 1, out_features]);
+
+        // Reference: matmul + bias
+        let expected_matmul =
+            reference_matmul(&act_data, &weight_deq, 1, in_features, out_features);
+        let expected: Vec<f32> = expected_matmul
+            .iter()
+            .zip(bias_data.iter())
+            .map(|(m, b)| m + b)
+            .collect();
+
+        let output_data = output.to_data();
+        let output_slice = output_data.as_slice::<f32>().unwrap();
+
+        let mut max_diff: f32 = 0.0;
+        for (a, b) in output_slice.iter().zip(expected.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        println!("Q4Linear with bias max diff: {:.4e}", max_diff);
+        assert!(
+            max_diff < 1e-3,
+            "Max diff {:.4e} exceeds tolerance 1e-3",
+            max_diff
+        );
+    }
+
+    // =========================================================================
+    // Q4FeedForward tests
+    // =========================================================================
+
+    #[test]
+    fn test_q4_feedforward_forward_shape() {
+        use crate::gguf::model::Q4FeedForward;
+
+        let device = Default::default();
+        let d_model = 64;
+        let ffn_dim = 128;
+
+        // w1: [ffn_dim, d_model], w2: [d_model, ffn_dim], w3: [ffn_dim, d_model]
+        let make_q4 = |rows: usize, cols: usize| -> Q4Linear {
+            let data: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i as f32) * 0.001).sin() * 0.05)
+                .collect();
+            let bytes = quantize_f32_to_q4_0(&data);
+            let tensor = Q4Tensor::from_q4_bytes(&bytes, [rows, cols], &device)
+                .expect("Failed to create Q4Tensor");
+            Q4Linear::new(tensor, None)
+        };
+
+        let w1 = make_q4(ffn_dim, d_model);
+        let w2 = make_q4(d_model, ffn_dim);
+        let w3 = make_q4(ffn_dim, d_model);
+        let ffn = Q4FeedForward::new(w1, w2, w3);
+
+        let input = Tensor::<TestBackend, 3>::zeros([1, 4, d_model], &device);
+        let output = ffn.forward(input);
+
+        assert_eq!(output.dims(), [1, 4, d_model]);
+    }
+
+    // =========================================================================
+    // Q4Adapter tests
+    // =========================================================================
+
+    #[test]
+    fn test_q4_adapter_forward_shape() {
+        use crate::gguf::model::Q4Adapter;
+
+        let device = Default::default();
+        let in_dim = 5120;
+        let out_dim = 3072;
+
+        // Use smaller dims for test speed but maintain the architecture
+        let test_in = 160;
+        let test_out = 96;
+
+        let make_q4 = |rows: usize, cols: usize| -> Q4Linear {
+            let data: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i as f32) * 0.001).cos() * 0.05)
+                .collect();
+            let bytes = quantize_f32_to_q4_0(&data);
+            let tensor = Q4Tensor::from_q4_bytes(&bytes, [rows, cols], &device)
+                .expect("Failed to create Q4Tensor");
+            Q4Linear::new(tensor, None)
+        };
+
+        // linear1: [out_dim, in_dim], linear2: [out_dim, out_dim]
+        let linear1 = make_q4(test_out, test_in);
+        let linear2 = make_q4(test_out, test_out);
+        let adapter = Q4Adapter::new(linear1, linear2);
+
+        let input = Tensor::<TestBackend, 3>::zeros([1, 4, test_in], &device);
+        let output = adapter.forward(input);
+
+        assert_eq!(output.dims(), [1, 4, test_out]);
+
+        // Also verify the real model dimensions would work (shape only, use small data)
+        let _ = (in_dim, out_dim); // confirm constants exist for documentation
+    }
+
+    // =========================================================================
+    // Batched q4_matmul test
+    // =========================================================================
+
     #[test]
     fn test_q4_matmul_batch() {
         let device = Default::default();

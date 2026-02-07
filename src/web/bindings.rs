@@ -288,7 +288,7 @@ impl VoxtralQ4 {
         // Run async autoregressive decoding (avoids into_scalar panic in WASM)
         let generated_tokens = self
             .decode_with_cache_async(model, audio_embeds, t_embed)
-            .await;
+            .await?;
 
         // Filter control tokens and decode
         let text_tokens: Vec<u32> = generated_tokens
@@ -319,7 +319,7 @@ impl VoxtralQ4 {
         model: &Q4VoxtralModel,
         audio_embeds: Tensor<Backend, 3>,
         t_embed: Tensor<Backend, 3>,
-    ) -> Vec<i32> {
+    ) -> Result<Vec<i32>, String> {
         let seq_len = audio_embeds.dims()[1];
         let d_model = audio_embeds.dims()[2];
 
@@ -328,7 +328,7 @@ impl VoxtralQ4 {
         const STREAMING_PAD: i32 = 32;
 
         if seq_len < PREFIX_LEN {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut decoder_cache = model.create_decoder_cache();
@@ -362,9 +362,9 @@ impl VoxtralQ4 {
         let first_pred = last_logits.argmax(2);
         let first_token: i32 = Tensor::<Backend, 3, Int>::into_data_async(first_pred)
             .await
-            .unwrap()
+            .map_err(|e| format!("Failed to read prediction tensor: {e}"))?
             .to_vec::<i32>()
-            .unwrap()[0];
+            .map_err(|e| format!("Failed to extract prediction data: {e}"))?[0];
 
         let mut generated = prefix;
         generated.push(first_token);
@@ -389,13 +389,13 @@ impl VoxtralQ4 {
             let pred = logits.argmax(2);
             let next_token: i32 = Tensor::<Backend, 3, Int>::into_data_async(pred)
                 .await
-                .unwrap()
+                .map_err(|e| format!("Failed to read prediction tensor: {e}"))?
                 .to_vec::<i32>()
-                .unwrap()[0];
+                .map_err(|e| format!("Failed to extract prediction data: {e}"))?[0];
             generated.push(next_token);
         }
 
-        generated.into_iter().skip(PREFIX_LEN).collect()
+        Ok(generated.into_iter().skip(PREFIX_LEN).collect())
     }
 }
 

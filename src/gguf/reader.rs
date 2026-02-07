@@ -277,7 +277,15 @@ impl Read for ShardedCursor {
         if self.pos >= self.total_len {
             return Ok(0);
         }
-        let (shard_idx, local_offset) = self.shard_for_offset(self.pos).unwrap();
+        let (shard_idx, local_offset) = self.shard_for_offset(self.pos).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "no shard found for offset {} (total_len={})",
+                    self.pos, self.total_len
+                ),
+            )
+        })?;
         let shard = &self.shards[shard_idx];
         let available = shard.len() - local_offset;
         let to_read = buf.len().min(available);

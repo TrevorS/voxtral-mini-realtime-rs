@@ -12,96 +12,13 @@ use burn::tensor::activation::{gelu, silu, softmax};
 use burn::tensor::{Int, Tensor, TensorData};
 
 use crate::models::adapter::reshape_encoder_output;
+use crate::models::layers::masking::{
+    apply_causal_mask, apply_causal_mask_with_offset, apply_sliding_window_mask,
+    apply_sliding_window_mask_with_offset,
+};
 use crate::models::layers::{ConvDownsampler, KVCache, LayerCaches, RmsNorm, RoPE};
 
 use super::linear::Q4Linear;
-
-// ---------------------------------------------------------------------------
-// Masking helpers (replicated from Attention's private methods)
-// ---------------------------------------------------------------------------
-
-/// Apply causal mask to attention scores (same-length Q and K).
-fn apply_causal_mask(scores: Tensor<Wgpu, 4>, seq_len: usize) -> Tensor<Wgpu, 4> {
-    let device = scores.device();
-    let mut mask_data = vec![0.0f32; seq_len * seq_len];
-    for i in 0..seq_len {
-        for j in (i + 1)..seq_len {
-            mask_data[i * seq_len + j] = f32::NEG_INFINITY;
-        }
-    }
-    let mask: Tensor<Wgpu, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
-    let mask: Tensor<Wgpu, 2> = mask.reshape([seq_len, seq_len]);
-    let mask: Tensor<Wgpu, 4> = mask.unsqueeze_dim::<3>(0).unsqueeze_dim(0);
-    scores + mask
-}
-
-/// Apply sliding window mask to attention scores (same-length Q and K).
-fn apply_sliding_window_mask(
-    scores: Tensor<Wgpu, 4>,
-    seq_len: usize,
-    window: usize,
-) -> Tensor<Wgpu, 4> {
-    let device = scores.device();
-    let mut mask_data = vec![0.0f32; seq_len * seq_len];
-    for i in 0..seq_len {
-        for j in 0..seq_len {
-            if i.abs_diff(j) > window {
-                mask_data[i * seq_len + j] = f32::NEG_INFINITY;
-            }
-        }
-    }
-    let mask: Tensor<Wgpu, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
-    let mask: Tensor<Wgpu, 2> = mask.reshape([seq_len, seq_len]);
-    let mask: Tensor<Wgpu, 4> = mask.unsqueeze_dim::<3>(0).unsqueeze_dim(0);
-    scores + mask
-}
-
-/// Apply causal mask with different Q/K lengths (for KV cache).
-fn apply_causal_mask_with_offset(
-    scores: Tensor<Wgpu, 4>,
-    q_len: usize,
-    kv_len: usize,
-    offset: usize,
-) -> Tensor<Wgpu, 4> {
-    let device = scores.device();
-    let mut mask_data = vec![0.0f32; q_len * kv_len];
-    for i in 0..q_len {
-        let actual_pos = offset + i;
-        for j in 0..kv_len {
-            if j > actual_pos {
-                mask_data[i * kv_len + j] = f32::NEG_INFINITY;
-            }
-        }
-    }
-    let mask: Tensor<Wgpu, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
-    let mask: Tensor<Wgpu, 2> = mask.reshape([q_len, kv_len]);
-    let mask: Tensor<Wgpu, 4> = mask.unsqueeze_dim::<3>(0).unsqueeze_dim(0);
-    scores + mask
-}
-
-/// Apply sliding window mask with different Q/K lengths (for KV cache).
-fn apply_sliding_window_mask_with_offset(
-    scores: Tensor<Wgpu, 4>,
-    q_len: usize,
-    kv_len: usize,
-    window: usize,
-    offset: usize,
-) -> Tensor<Wgpu, 4> {
-    let device = scores.device();
-    let mut mask_data = vec![0.0f32; q_len * kv_len];
-    for i in 0..q_len {
-        let actual_pos = offset + i;
-        for j in 0..kv_len {
-            if actual_pos.abs_diff(j) > window {
-                mask_data[i * kv_len + j] = f32::NEG_INFINITY;
-            }
-        }
-    }
-    let mask: Tensor<Wgpu, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
-    let mask: Tensor<Wgpu, 2> = mask.reshape([q_len, kv_len]);
-    let mask: Tensor<Wgpu, 4> = mask.unsqueeze_dim::<3>(0).unsqueeze_dim(0);
-    scores + mask
-}
 
 // ---------------------------------------------------------------------------
 // Q4Attention
@@ -637,7 +554,9 @@ impl Q4LanguageModel {
             TokEmbedStore::Q4 { cpu_bytes, .. } => {
                 let [batch, seq] = token_ids.dims();
                 let id_data = token_ids.into_data();
-                let ids: Vec<i32> = id_data.to_vec().unwrap();
+                let ids: Vec<i32> = id_data
+                    .to_vec()
+                    .expect("tensor data extraction for token IDs");
                 self.embed_from_q4_bytes(cpu_bytes, &ids, batch, seq)
             }
         }

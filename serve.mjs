@@ -106,8 +106,6 @@ const server = createServer(TLS, (req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`\nVoxtral dev server running:`);
   console.log(`  Local:   https://localhost:${PORT}`);
-  console.log(`  LAN:     https://spark-ebf0:${PORT}`);
-  console.log(`  LAN IP:  https://192.168.1.74:${PORT}`);
   console.log(`\nModel shards: ${shardNames.length} (${SHARD_DIR})`);
   console.log(`\nNote: Accept the self-signed certificate in your browser.\n`);
 });

@@ -1,5 +1,7 @@
 # Voxtral Mini 4B Realtime (Rust)
 
+[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97-Model_on_HuggingFace-yellow)](https://huggingface.co/TrevorJS/voxtral-mini-realtime-gguf)
+
 Streaming speech recognition running natively and in the browser. A pure Rust implementation of [Mistral's Voxtral Mini 4B Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) model using the [Burn](https://burn.dev) ML framework.
 
 The Q4 GGUF quantized path (2.5 GB) runs entirely client-side in a browser tab via WASM + WebGPU.

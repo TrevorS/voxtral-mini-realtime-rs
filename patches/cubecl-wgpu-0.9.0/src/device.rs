@@ -75,7 +75,7 @@ impl Device for WgpuDevice {
         }
     }
 
-    fn device_count(type_id: u16) -> usize {
+    fn device_count(_type_id: u16) -> usize {
         #[cfg(target_family = "wasm")]
         {
             // WebGPU only supports a single device currently.
@@ -93,7 +93,7 @@ impl Device for WgpuDevice {
                 .into_iter()
                 .filter(|adapter| {
                     // Default doesn't filter device types.
-                    if type_id == 4 {
+                    if _type_id == 4 {
                         return true;
                     }
 
@@ -107,7 +107,7 @@ impl Device for WgpuDevice {
                         wgpu::DeviceType::Cpu => 3,
                     };
 
-                    adapter_type_id == type_id
+                    adapter_type_id == _type_id
                 })
                 .collect();
             adapters.len()

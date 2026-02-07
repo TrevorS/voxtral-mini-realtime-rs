@@ -302,26 +302,7 @@ impl<B: Backend> Attention<B> {
         seq_len: usize,
         _offset: usize,
     ) -> Tensor<B, 4> {
-        let device = scores.device();
-
-        // Create causal mask: upper triangular matrix of -inf
-        // Position (i, j) is masked if j > i
-        let mut mask_data = vec![0.0f32; seq_len * seq_len];
-        for i in 0..seq_len {
-            for j in 0..seq_len {
-                if j > i {
-                    mask_data[i * seq_len + j] = f32::NEG_INFINITY;
-                }
-            }
-        }
-
-        let mask: Tensor<B, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
-        let mask: Tensor<B, 2> = mask.reshape([seq_len, seq_len]);
-
-        // Broadcast mask: [seq, seq] -> [1, 1, seq, seq]
-        let mask: Tensor<B, 4> = mask.unsqueeze_dim::<3>(0).unsqueeze_dim(0);
-
-        scores + mask
+        super::masking::apply_causal_mask(scores, seq_len)
     }
 
     /// Apply sliding window mask to attention scores.
@@ -331,34 +312,10 @@ impl<B: Backend> Attention<B> {
         seq_len: usize,
         window: usize,
     ) -> Tensor<B, 4> {
-        let device = scores.device();
-
-        // Mask positions outside the sliding window
-        // Position (i, j) is masked if |i - j| > window
-        let mut mask_data = vec![0.0f32; seq_len * seq_len];
-        for i in 0..seq_len {
-            for j in 0..seq_len {
-                let dist = i.abs_diff(j);
-                if dist > window {
-                    mask_data[i * seq_len + j] = f32::NEG_INFINITY;
-                }
-            }
-        }
-
-        let mask: Tensor<B, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
-        let mask: Tensor<B, 2> = mask.reshape([seq_len, seq_len]);
-        let mask: Tensor<B, 4> = mask.unsqueeze_dim::<3>(0).unsqueeze_dim(0);
-
-        scores + mask
+        super::masking::apply_sliding_window_mask(scores, seq_len, window)
     }
 
     /// Apply causal mask with different query/key lengths (for KV cache).
-    ///
-    /// # Arguments
-    /// * `scores` - Attention scores [batch, heads, q_len, kv_len]
-    /// * `q_len` - Query sequence length (new tokens)
-    /// * `kv_len` - Key/value sequence length (total cached + new)
-    /// * `offset` - Position offset (cache length before this step)
     fn apply_causal_mask_with_offset(
         &self,
         scores: Tensor<B, 4>,
@@ -366,25 +323,7 @@ impl<B: Backend> Attention<B> {
         kv_len: usize,
         offset: usize,
     ) -> Tensor<B, 4> {
-        let device = scores.device();
-
-        // For each query position i (0..q_len), it can attend to key positions j (0..kv_len)
-        // if j <= offset + i (causal: can only attend to past and current position)
-        let mut mask_data = vec![0.0f32; q_len * kv_len];
-        for i in 0..q_len {
-            let actual_pos = offset + i; // Actual position in full sequence
-            for j in 0..kv_len {
-                if j > actual_pos {
-                    mask_data[i * kv_len + j] = f32::NEG_INFINITY;
-                }
-            }
-        }
-
-        let mask: Tensor<B, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
-        let mask: Tensor<B, 2> = mask.reshape([q_len, kv_len]);
-        let mask: Tensor<B, 4> = mask.unsqueeze_dim::<3>(0).unsqueeze_dim(0);
-
-        scores + mask
+        super::masking::apply_causal_mask_with_offset(scores, q_len, kv_len, offset)
     }
 
     /// Apply sliding window mask with different query/key lengths (for KV cache).
@@ -396,27 +335,7 @@ impl<B: Backend> Attention<B> {
         window: usize,
         offset: usize,
     ) -> Tensor<B, 4> {
-        let device = scores.device();
-
-        // For each query position i, mask key positions j outside the window
-        // Query actual position: offset + i
-        // Mask if |actual_pos - j| > window
-        let mut mask_data = vec![0.0f32; q_len * kv_len];
-        for i in 0..q_len {
-            let actual_pos = offset + i;
-            for j in 0..kv_len {
-                let dist = actual_pos.abs_diff(j);
-                if dist > window {
-                    mask_data[i * kv_len + j] = f32::NEG_INFINITY;
-                }
-            }
-        }
-
-        let mask: Tensor<B, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
-        let mask: Tensor<B, 2> = mask.reshape([q_len, kv_len]);
-        let mask: Tensor<B, 4> = mask.unsqueeze_dim::<3>(0).unsqueeze_dim(0);
-
-        scores + mask
+        super::masking::apply_sliding_window_mask_with_offset(scores, q_len, kv_len, window, offset)
     }
 }
 
