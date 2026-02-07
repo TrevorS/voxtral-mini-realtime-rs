@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voxtral Mini 4B Realtime</title>
+    <style>
+        :root {
+            --bg: #151515;
+            --surface: #1c1c1c;
+            --border: #303030;
+            --blue: #8197bf;
+            --blue-dim: #667a9c;
+            --green: #99ad6a;
+            --orange: #cf6a4c;
+            --yellow: #fad07a;
+            --amber: #ffb964;
+            --text: #e8e8d3;
+            --muted: #605958;
+            --comment: #888888;
+            --visual: #404040;
+        }
+
+        * { box-sizing: border-box; margin: 0; }
+
+        body {
+            font-family: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', Menlo, monospace;
+            background: var(--bg);
+            color: var(--text);
+            padding: 1.5rem;
+            min-height: 100vh;
+            font-size: 14px;
+        }
+
+        .wrap {
+            max-width: 720px;
+            margin: 0 auto;
+        }
+
+        header {
+            margin-bottom: 1.5rem;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 1rem;
+        }
+
+        header h1 {
+            font-size: 1.3rem;
+            font-weight: 600;
+            color: var(--amber);
+        }
+
+        header p {
+            color: var(--muted);
+            font-size: 0.8rem;
+            margin-top: 0.25rem;
+        }
+
+        section {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        section h2 {
+            font-size: 0.75rem;
+            color: var(--comment);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.75rem;
+            font-weight: normal;
+        }
+
+        .output-box {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            padding: 0.75rem;
+            min-height: 80px;
+            font-size: 0.9rem;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            color: var(--text);
+        }
+
+        .output-box.placeholder {
+            color: var(--muted);
+        }
+
+        /* status bar */
+        .status-line {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.75rem;
+            font-size: 0.8rem;
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--muted);
+            flex-shrink: 0;
+        }
+        .dot.loading { background: var(--yellow); }
+        .dot.ready { background: var(--green); }
+        .dot.error { background: var(--orange); }
+        .dot.recording { background: var(--orange); animation: blink 1s infinite; }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        .progress-track {
+            height: 3px;
+            background: var(--border);
+            border-radius: 2px;
+            overflow: hidden;
+            margin-bottom: 0.75rem;
+            display: none;
+        }
+        .progress-fill {
+            height: 100%;
+            background: var(--blue);
+            width: 0%;
+            transition: width 0.3s;
+        }
+
+        /* buttons */
+        button {
+            font-family: inherit;
+            font-size: 0.8rem;
+            padding: 0.4rem 0.8rem;
+            border-radius: 3px;
+            border: 1px solid var(--border);
+            cursor: pointer;
+            transition: background 0.15s, border-color 0.15s;
+            color: var(--text);
+            background: var(--visual);
+        }
+
+        button:hover:not(:disabled) {
+            border-color: var(--blue-dim);
+            background: #353535;
+        }
+
+        button:disabled {
+            opacity: 0.35;
+            cursor: default;
+        }
+
+        button.primary {
+            background: var(--blue-dim);
+            border-color: var(--blue);
+            color: #151515;
+            font-weight: 600;
+        }
+        button.primary:hover:not(:disabled) {
+            background: var(--blue);
+        }
+
+        button.danger {
+            color: var(--orange);
+            border-color: var(--orange);
+            background: transparent;
+        }
+        button.danger:hover:not(:disabled) {
+            background: rgba(207, 106, 76, 0.15);
+        }
+
+        /* audio controls row */
+        .controls {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .controls .sep {
+            color: var(--muted);
+            font-size: 0.75rem;
+            padding: 0 0.25rem;
+        }
+
+        .file-pick {
+            position: relative;
+        }
+        .file-pick input { display: none; }
+        .file-pick label {
+            display: inline-block;
+            font-family: inherit;
+            font-size: 0.8rem;
+            padding: 0.4rem 0.8rem;
+            border-radius: 3px;
+            border: 1px dashed var(--border);
+            cursor: pointer;
+            color: var(--text);
+            transition: border-color 0.15s;
+        }
+        .file-pick label:hover {
+            border-color: var(--blue-dim);
+        }
+
+        .audio-info {
+            font-size: 0.75rem;
+            color: var(--comment);
+        }
+
+        /* mic visualizer */
+        .mic-viz {
+            height: 32px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            margin-bottom: 0.75rem;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+        .mic-viz.active { display: flex; }
+
+        .mic-viz .bars {
+            display: flex;
+            gap: 2px;
+            height: 20px;
+            align-items: flex-end;
+        }
+        .mic-viz .bar {
+            width: 3px;
+            background: var(--orange);
+            border-radius: 1px;
+            animation: bounce 0.5s ease-in-out infinite;
+        }
+        @keyframes bounce {
+            0%, 100% { height: 15%; }
+            50% { height: 100%; }
+        }
+        .mic-viz .bar:nth-child(1) { animation-delay: 0s; }
+        .mic-viz .bar:nth-child(2) { animation-delay: 0.1s; }
+        .mic-viz .bar:nth-child(3) { animation-delay: 0.15s; }
+        .mic-viz .bar:nth-child(4) { animation-delay: 0.25s; }
+        .mic-viz .bar:nth-child(5) { animation-delay: 0.35s; }
+
+        .timer {
+            font-size: 0.85rem;
+            color: var(--orange);
+        }
+
+        /* model section */
+        .model-row {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .cache-info {
+            font-size: 0.75rem;
+            color: var(--comment);
+            margin-top: 0.5rem;
+        }
+
+        .cache-info a {
+            color: var(--blue-dim);
+            text-decoration: none;
+        }
+        .cache-info a:hover { text-decoration: underline; }
+
+        /* warning */
+        .no-webgpu {
+            background: rgba(207, 106, 76, 0.1);
+            border: 1px solid var(--orange);
+            border-radius: 4px;
+            padding: 0.75rem;
+            margin-bottom: 1rem;
+            color: var(--orange);
+            font-size: 0.8rem;
+            display: none;
+        }
+
+        footer {
+            text-align: center;
+            margin-top: 1rem;
+            font-size: 0.7rem;
+            color: var(--muted);
+        }
+        footer a { color: var(--blue-dim); text-decoration: none; }
+        footer a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <header>
+            <h1>voxtral-mini-4b-realtime</h1>
+            <p>Q4 GGUF &middot; Rust/WASM &middot; WebGPU &middot; runs entirely in your browser</p>
+        </header>
+
+        <div id="webgpu-warning" class="no-webgpu">
+            WebGPU not detected. Requires Chrome 113+, Edge 113+, or Firefox Nightly.
+        </div>
+
+        <section>
+            <h2>output</h2>
+            <div class="output-box placeholder" id="transcription">1. Load the model (~2.5 GB Q4 weights from HuggingFace)
+2. Record from your mic or pick an audio file
+3. Transcription appears here
+
+Weights are cached in the browser after first download.</div>
+        </section>
+
+        <section>
+            <h2>audio</h2>
+
+            <div class="mic-viz" id="mic-viz">
+                <div class="bars">
+                    <div class="bar"></div>
+                    <div class="bar"></div>
+                    <div class="bar"></div>
+                    <div class="bar"></div>
+                    <div class="bar"></div>
+                </div>
+                <span class="timer" id="rec-timer">0:00</span>
+            </div>
+
+            <div class="controls">
+                <button id="mic-btn" disabled>mic</button>
+                <button id="stop-mic-btn" style="display:none;">stop & transcribe</button>
+                <button id="cancel-mic-btn" style="display:none;">cancel</button>
+                <span class="sep">|</span>
+                <div class="file-pick">
+                    <input type="file" id="audio-file" accept="audio/*">
+                    <label for="audio-file">choose file...</label>
+                </div>
+                <button id="transcribe-btn" disabled>transcribe</button>
+                <span id="audio-info" class="audio-info"></span>
+            </div>
+        </section>
+
+        <section>
+            <h2>model</h2>
+            <div class="status-line">
+                <div class="dot" id="status-dot"></div>
+                <span id="status-text">not loaded</span>
+            </div>
+            <div class="progress-track" id="progress-track">
+                <div class="progress-fill" id="progress-fill"></div>
+            </div>
+            <div class="model-row">
+                <button id="load-btn" class="primary" disabled>load weights</button>
+                <button id="clear-cache-btn" class="danger" style="display:none;">clear cache</button>
+            </div>
+            <div class="cache-info" id="cache-info">
+                <a href="https://huggingface.co/TrevorJS/voxtral-mini-realtime-gguf" target="_blank">TrevorJS/voxtral-mini-realtime-gguf</a>
+            </div>
+        </section>
+
+        <footer>
+            rust + burn + wasm + webgpu &middot;
+            <a href="https://github.com/TrevorS/voxtral-mini-realtime-rs">source</a>
+        </footer>
+    </div>
+
+    <script type="module">
+        import { VoxtralClient } from './voxtral-client.js';
+
+        if (!navigator.gpu) {
+            document.getElementById('webgpu-warning').style.display = 'block';
+        }
+
+        const client = new VoxtralClient();
+
+        const $ = id => document.getElementById(id);
+        const statusDot = $('status-dot');
+        const statusText = $('status-text');
+        const progressTrack = $('progress-track');
+        const progressFill = $('progress-fill');
+        const transcriptionEl = $('transcription');
+        const audioInfo = $('audio-info');
+        const loadBtn = $('load-btn');
+        const clearCacheBtn = $('clear-cache-btn');
+        const cacheInfo = $('cache-info');
+        const micBtn = $('mic-btn');
+        const stopMicBtn = $('stop-mic-btn');
+        const cancelMicBtn = $('cancel-mic-btn');
+        const transcribeBtn = $('transcribe-btn');
+        const micViz = $('mic-viz');
+        const recTimer = $('rec-timer');
+
+        let audioFile = null;
+        let recStartTime = null;
+        let recTimerInterval = null;
+
+        function setStatus(cls, text) {
+            statusDot.className = 'dot ' + cls;
+            statusText.textContent = text;
+        }
+
+        function syncButtons() {
+            loadBtn.disabled = !(client.ready && !client.modelLoaded);
+            micBtn.disabled = !client.isReady();
+            transcribeBtn.disabled = !(client.isReady() && audioFile);
+        }
+
+        function clearOutput() {
+            transcriptionEl.textContent = '';
+            transcriptionEl.classList.remove('placeholder');
+        }
+
+        client.setProgressCallback((stage, percent) => {
+            setStatus('loading', stage);
+            if (percent !== undefined) {
+                progressTrack.style.display = 'block';
+                progressFill.style.width = percent + '%';
+            }
+        });
+
+        async function updateCacheStatus() {
+            try {
+                const s = await client.checkCache();
+                if (s.cached) {
+                    cacheInfo.innerHTML = `weights cached (${s.shardsCached}/${s.shardsTotal} shards) · <a href="https://huggingface.co/TrevorJS/voxtral-mini-realtime-gguf" target="_blank">TrevorJS/voxtral-mini-realtime-gguf</a>`;
+                    clearCacheBtn.style.display = '';
+                } else if (s.shardsCached > 0) {
+                    cacheInfo.innerHTML = `${s.shardsCached}/${s.shardsTotal} shards cached · <a href="https://huggingface.co/TrevorJS/voxtral-mini-realtime-gguf" target="_blank">TrevorJS/voxtral-mini-realtime-gguf</a>`;
+                    clearCacheBtn.style.display = '';
+                } else {
+                    cacheInfo.innerHTML = `<a href="https://huggingface.co/TrevorJS/voxtral-mini-realtime-gguf" target="_blank">TrevorJS/voxtral-mini-realtime-gguf</a> · ~2.5 GB download`;
+                    clearCacheBtn.style.display = 'none';
+                }
+            } catch {
+                // Cache API unavailable
+            }
+        }
+
+        // Init
+        (async () => {
+            try {
+                setStatus('loading', 'initializing wasm + webgpu...');
+                await client.init();
+                setStatus('', 'ready — load weights to begin');
+                syncButtons();
+                await updateCacheStatus();
+            } catch (e) {
+                setStatus('error', 'init failed: ' + e.message);
+                console.error(e);
+            }
+        })();
+
+        // Load model
+        loadBtn.addEventListener('click', async () => {
+            loadBtn.disabled = true;
+            clearOutput();
+            try {
+                progressTrack.style.display = 'block';
+                await client.loadFromServer();
+                progressTrack.style.display = 'none';
+                setStatus('ready', 'model loaded');
+                syncButtons();
+                await updateCacheStatus();
+            } catch (e) {
+                setStatus('error', 'load failed: ' + e.message);
+                progressTrack.style.display = 'none';
+                syncButtons();
+                console.error(e);
+            }
+        });
+
+        // Clear cache
+        clearCacheBtn.addEventListener('click', async () => {
+            await client.clearCache();
+            await updateCacheStatus();
+        });
+
+        // Audio file
+        $('audio-file').addEventListener('change', (e) => {
+            audioFile = e.target.files[0];
+            if (!audioFile) return;
+            audioInfo.textContent = `${audioFile.name} (${(audioFile.size / 1024).toFixed(0)} KB)`;
+            syncButtons();
+        });
+
+        // Transcribe file
+        transcribeBtn.addEventListener('click', async () => {
+            if (!client.isReady() || !audioFile) return;
+            transcribeBtn.disabled = true;
+            micBtn.disabled = true;
+            clearOutput();
+            transcriptionEl.textContent = 'transcribing...';
+            transcriptionEl.classList.add('placeholder');
+
+            try {
+                const text = await client.transcribeFile(audioFile);
+                transcriptionEl.textContent = text || '(no speech detected)';
+                transcriptionEl.classList.remove('placeholder');
+                setStatus('ready', 'done');
+            } catch (e) {
+                transcriptionEl.textContent = 'error: ' + (e.message || String(e));
+                transcriptionEl.classList.remove('placeholder');
+                setStatus('error', 'transcription failed');
+                console.error(e);
+            } finally {
+                syncButtons();
+            }
+        });
+
+        // Mic
+        function tickTimer() {
+            if (!recStartTime) return;
+            const s = Math.floor((Date.now() - recStartTime) / 1000);
+            recTimer.textContent = `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`;
+        }
+
+        micBtn.addEventListener('click', async () => {
+            try {
+                clearOutput();
+                await client.startMicrophone();
+                micBtn.style.display = 'none';
+                stopMicBtn.style.display = '';
+                cancelMicBtn.style.display = '';
+                micViz.classList.add('active');
+                statusDot.className = 'dot recording';
+                recStartTime = Date.now();
+                recTimerInterval = setInterval(tickTimer, 1000);
+                tickTimer();
+            } catch (e) {
+                setStatus('error', 'mic: ' + e.message);
+                console.error(e);
+            }
+        });
+
+        stopMicBtn.addEventListener('click', async () => {
+            clearInterval(recTimerInterval);
+            micBtn.style.display = '';
+            stopMicBtn.style.display = 'none';
+            cancelMicBtn.style.display = 'none';
+            micViz.classList.remove('active');
+            transcriptionEl.textContent = 'transcribing...';
+            transcriptionEl.classList.add('placeholder');
+
+            try {
+                const text = await client.stopAndTranscribe();
+                transcriptionEl.textContent = text || '(no speech detected)';
+                transcriptionEl.classList.remove('placeholder');
+                setStatus('ready', 'done');
+            } catch (e) {
+                transcriptionEl.textContent = 'error: ' + (e.message || String(e));
+                transcriptionEl.classList.remove('placeholder');
+                setStatus('error', 'transcription failed');
+                console.error(e);
+            } finally {
+                syncButtons();
+            }
+        });
+
+        cancelMicBtn.addEventListener('click', () => {
+            client.cancelMicrophone();
+            clearInterval(recTimerInterval);
+            micBtn.style.display = '';
+            stopMicBtn.style.display = 'none';
+            cancelMicBtn.style.display = 'none';
+            micViz.classList.remove('active');
+            setStatus('ready', 'model loaded');
+        });
+    </script>
+</body>
+</html>

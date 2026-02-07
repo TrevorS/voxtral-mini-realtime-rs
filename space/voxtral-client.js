@@ -1,0 +1,389 @@
+/**
+ * Voxtral Client - Browser API for Q4 GGUF speech transcription.
+ *
+ * Handles WebWorker communication and Web Audio API for microphone input.
+ *
+ * Usage:
+ *   const client = new VoxtralClient();
+ *   await client.init();
+ *   await client.loadFromServer();
+ *
+ *   // Transcribe file
+ *   const text = await client.transcribeFile(audioFile);
+ *
+ *   // Or use microphone
+ *   await client.startMicrophone();
+ *   // ... recording ...
+ *   const text = await client.stopAndTranscribe();
+ */
+
+export class VoxtralClient {
+    constructor() {
+        this.worker = null;
+        this.ready = false;
+        this.modelLoaded = false;
+        this.pendingResolve = null;
+        this.pendingReject = null;
+        this.onProgress = null;
+
+        // Microphone state
+        this.audioContext = null;
+        this.mediaStream = null;
+        this.mediaRecorder = null;
+        this.recordedChunks = [];
+
+        // Audio processing
+        this.targetSampleRate = 16000;
+    }
+
+    /**
+     * Initialize the WebWorker and WASM module.
+     */
+    async init() {
+        return new Promise((resolve, reject) => {
+            this.worker = new Worker('./worker.js', { type: 'module' });
+
+            this.worker.onmessage = (e) => this._handleMessage(e);
+            this.worker.onerror = (e) => {
+                reject(new Error(`Worker error: ${e.message}`));
+            };
+
+            this.pendingResolve = () => {
+                this.ready = true;
+                resolve();
+            };
+            this.pendingReject = reject;
+
+            this.worker.postMessage({ type: 'init' });
+        });
+    }
+
+    /**
+     * Load Q4 GGUF model weights and tokenizer.
+     * @param {ArrayBuffer|Uint8Array} ggufBytes - GGUF model weights (~2GB)
+     * @param {string} tokenizerJson - Tokenizer JSON string
+     */
+    async loadModel(ggufBytes, tokenizerJson) {
+        if (!this.ready) {
+            throw new Error('Client not initialized. Call init() first.');
+        }
+
+        return new Promise((resolve, reject) => {
+            this.pendingResolve = () => {
+                this.modelLoaded = true;
+                resolve();
+            };
+            this.pendingReject = reject;
+
+            // Transfer the ArrayBuffer for efficiency
+            const bytes = ggufBytes instanceof Uint8Array
+                ? ggufBytes.buffer
+                : ggufBytes;
+
+            this.worker.postMessage(
+                { type: 'loadModel', ggufBytes: bytes, tokenizerJson },
+                [bytes]
+            );
+        });
+    }
+
+    /**
+     * Load model shards from HuggingFace CDN.
+     */
+    async loadFromServer() {
+        if (!this.ready) {
+            throw new Error('Client not initialized. Call init() first.');
+        }
+
+        return new Promise((resolve, reject) => {
+            this.pendingResolve = () => {
+                this.modelLoaded = true;
+                resolve();
+            };
+            this.pendingReject = reject;
+
+            this.worker.postMessage({ type: 'loadFromServer' });
+        });
+    }
+
+    /**
+     * Check if the model is ready for transcription.
+     */
+    isReady() {
+        return this.ready && this.modelLoaded;
+    }
+
+    /**
+     * Transcribe audio samples.
+     * @param {Float32Array} audio - 16kHz mono audio samples
+     * @returns {Promise<string>} Transcribed text
+     */
+    async transcribe(audio) {
+        if (!this.isReady()) {
+            throw new Error('Model not loaded. Call loadModel() first.');
+        }
+
+        return new Promise((resolve, reject) => {
+            this.pendingResolve = resolve;
+            this.pendingReject = reject;
+
+            // Transfer the buffer for efficiency
+            this.worker.postMessage(
+                { type: 'transcribe', audio },
+                [audio.buffer]
+            );
+        });
+    }
+
+    /**
+     * Transcribe an audio file.
+     * @param {File|Blob} file - Audio file (WAV, MP3, etc.)
+     * @returns {Promise<string>} Transcribed text
+     */
+    async transcribeFile(file) {
+        const audio = await this._decodeAudioFile(file);
+        return this.transcribe(audio);
+    }
+
+    /**
+     * Start microphone recording.
+     * @returns {Promise<void>}
+     */
+    async startMicrophone() {
+        this.mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                channelCount: 1,
+                sampleRate: this.targetSampleRate,
+                echoCancellation: true,
+                noiseSuppression: true,
+            }
+        });
+
+        this.audioContext = new AudioContext({ sampleRate: this.targetSampleRate });
+
+        this.recordedChunks = [];
+        this.mediaRecorder = new MediaRecorder(this.mediaStream, {
+            mimeType: this._getSupportedMimeType()
+        });
+
+        this.mediaRecorder.ondataavailable = (e) => {
+            if (e.data.size > 0) {
+                this.recordedChunks.push(e.data);
+            }
+        };
+
+        this.mediaRecorder.start(100);
+    }
+
+    /**
+     * Stop microphone and transcribe the recording.
+     * @returns {Promise<string>} Transcribed text
+     */
+    async stopAndTranscribe() {
+        if (!this.mediaRecorder || this.mediaRecorder.state === 'inactive') {
+            throw new Error('Microphone not recording.');
+        }
+
+        const audioBlob = await new Promise((resolve) => {
+            this.mediaRecorder.onstop = () => {
+                const blob = new Blob(this.recordedChunks, {
+                    type: this.mediaRecorder.mimeType
+                });
+                resolve(blob);
+            };
+            this.mediaRecorder.stop();
+        });
+
+        this._stopMicrophone();
+
+        const audio = await this._decodeAudioFile(audioBlob);
+        return this.transcribe(audio);
+    }
+
+    /**
+     * Cancel microphone recording without transcribing.
+     */
+    cancelMicrophone() {
+        if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+            this.mediaRecorder.stop();
+        }
+        this._stopMicrophone();
+    }
+
+    /**
+     * Check if currently recording.
+     */
+    isRecording() {
+        return this.mediaRecorder && this.mediaRecorder.state === 'recording';
+    }
+
+    /**
+     * Set progress callback.
+     * @param {function(string, number?)} callback - Called with (stage, percent?)
+     */
+    setProgressCallback(callback) {
+        this.onProgress = callback;
+    }
+
+    /**
+     * Clean up resources.
+     */
+    dispose() {
+        this._stopMicrophone();
+        if (this.audioContext) {
+            this.audioContext.close();
+            this.audioContext = null;
+        }
+        if (this.worker) {
+            this.worker.terminate();
+            this.worker = null;
+        }
+        this.ready = false;
+        this.modelLoaded = false;
+    }
+
+    /**
+     * Clear cached model weights.
+     */
+    async clearCache() {
+        if (!this.worker) throw new Error('Client not initialized.');
+        return new Promise((resolve, reject) => {
+            this.pendingResolve = resolve;
+            this.pendingReject = reject;
+            this.worker.postMessage({ type: 'clearCache' });
+        });
+    }
+
+    /**
+     * Check if weights are cached.
+     * @returns {Promise<{cached: boolean, shardsCached: number, shardsTotal: number}>}
+     */
+    async checkCache() {
+        if (!this.worker) throw new Error('Client not initialized.');
+        return new Promise((resolve, reject) => {
+            this.pendingResolve = resolve;
+            this.pendingReject = reject;
+            this.worker.postMessage({ type: 'checkCache' });
+        });
+    }
+
+    // Private methods
+
+    _handleMessage(e) {
+        const { type, ...data } = e.data;
+
+        switch (type) {
+            case 'ready':
+            case 'modelLoaded':
+                if (this.pendingResolve) {
+                    this.pendingResolve();
+                    this.pendingResolve = null;
+                    this.pendingReject = null;
+                }
+                break;
+
+            case 'transcription':
+                if (this.pendingResolve) {
+                    this.pendingResolve(data.text);
+                    this.pendingResolve = null;
+                    this.pendingReject = null;
+                }
+                break;
+
+            case 'cacheCleared':
+                if (this.pendingResolve) {
+                    this.pendingResolve(data.deleted);
+                    this.pendingResolve = null;
+                    this.pendingReject = null;
+                }
+                break;
+
+            case 'cacheStatus':
+                if (this.pendingResolve) {
+                    this.pendingResolve(data);
+                    this.pendingResolve = null;
+                    this.pendingReject = null;
+                }
+                break;
+
+            case 'error':
+                if (this.pendingReject) {
+                    this.pendingReject(new Error(data.message));
+                    this.pendingResolve = null;
+                    this.pendingReject = null;
+                }
+                break;
+
+            case 'progress':
+                if (this.onProgress) {
+                    this.onProgress(data.stage, data.percent);
+                }
+                break;
+        }
+    }
+
+    async _decodeAudioFile(file) {
+        const arrayBuffer = await file.arrayBuffer();
+
+        // Decode at native sample rate — don't force 16kHz on AudioContext
+        // (browsers can silently ignore the requested rate)
+        const audioContext = new AudioContext();
+        const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+        await audioContext.close();
+
+        // Mix to mono
+        let mono;
+        if (audioBuffer.numberOfChannels === 1) {
+            mono = audioBuffer.getChannelData(0);
+        } else {
+            const left = audioBuffer.getChannelData(0);
+            const right = audioBuffer.getChannelData(1);
+            mono = new Float32Array(left.length);
+            for (let i = 0; i < left.length; i++) {
+                mono[i] = (left[i] + right[i]) / 2;
+            }
+        }
+
+        // Resample to 16kHz using OfflineAudioContext (proper anti-aliased sinc resampling)
+        if (audioBuffer.sampleRate === this.targetSampleRate) {
+            return mono;
+        }
+
+        const outLength = Math.ceil(mono.length * this.targetSampleRate / audioBuffer.sampleRate);
+        const offlineCtx = new OfflineAudioContext(1, outLength, this.targetSampleRate);
+        const srcBuf = offlineCtx.createBuffer(1, mono.length, audioBuffer.sampleRate);
+        srcBuf.getChannelData(0).set(mono);
+        const src = offlineCtx.createBufferSource();
+        src.buffer = srcBuf;
+        src.connect(offlineCtx.destination);
+        src.start(0);
+        const rendered = await offlineCtx.startRendering();
+        return rendered.getChannelData(0);
+    }
+
+    _stopMicrophone() {
+        if (this.mediaStream) {
+            this.mediaStream.getTracks().forEach(track => track.stop());
+            this.mediaStream = null;
+        }
+        this.mediaRecorder = null;
+        this.recordedChunks = [];
+    }
+
+    _getSupportedMimeType() {
+        const types = [
+            'audio/webm;codecs=opus',
+            'audio/webm',
+            'audio/ogg;codecs=opus',
+            'audio/mp4',
+        ];
+
+        for (const type of types) {
+            if (MediaRecorder.isTypeSupported(type)) {
+                return type;
+            }
+        }
+
+        return '';
+    }
+}

@@ -2,6 +2,16 @@
 //!
 //! Voxtral streaming mode requires left-padding audio with silence to align
 //! with the prefix tokens. This module implements the padding logic.
+//!
+//! ## Q4 quantization note
+//!
+//! The upstream mistral-common library uses 32 left-pad tokens (at 12.5 Hz),
+//! which produces only 16 decoder tokens of silence in the 38-token streaming
+//! prefix. The f32 model tolerates speech content in the remaining 22 prefix
+//! positions, but Q4_0 quantization makes the model sensitive to it — audio
+//! that starts immediately with speech (no leading silence) produces all-pad
+//! output. We use 76 left-pad tokens instead, which covers the full 38-token
+//! prefix with silence. See `PadConfig::default()` for details.
 
 use super::AudioBuffer;
 
@@ -10,7 +20,7 @@ use super::AudioBuffer;
 pub struct PadConfig {
     /// Sample rate (must be 16kHz for Voxtral).
     pub sample_rate: u32,
-    /// Number of left padding tokens (default: 32).
+    /// Number of left padding tokens (default: 76, upstream default: 32).
     pub n_left_pad_tokens: usize,
     /// Frame rate in Hz (default: 12.5).
     pub frame_rate: f32,
@@ -23,7 +33,12 @@ impl Default for PadConfig {
     fn default() -> Self {
         Self {
             sample_rate: 16000,
-            n_left_pad_tokens: 32,
+            // 76 tokens at 12.5 Hz = 38 decoder tokens, matching the streaming
+            // prefix length (BOS + 37 pad). The Q4 model is sensitive to speech
+            // content in the prefix — this ensures the prefix sees only silence.
+            // The f32 model works with 32 (the mistral-common default) but Q4
+            // needs the full prefix covered.
+            n_left_pad_tokens: 76,
             frame_rate: 12.5,
             extra_right_pad_tokens: 17,
         }
@@ -100,10 +115,10 @@ mod tests {
     fn test_pad_config_defaults() {
         let config = PadConfig::voxtral();
         assert_eq!(config.sample_rate, 16000);
-        assert_eq!(config.n_left_pad_tokens, 32);
+        assert_eq!(config.n_left_pad_tokens, 76);
         assert_eq!(config.frame_rate, 12.5);
         assert_eq!(config.samples_per_token(), 1280);
-        assert_eq!(config.left_pad_samples(), 40960);
+        assert_eq!(config.left_pad_samples(), 76 * 1280);
     }
 
     #[test]
@@ -132,9 +147,9 @@ mod tests {
         };
 
         let padded = pad_audio(&audio, &config);
+        let left_pad = config.left_pad_samples();
 
         // Check left padding (zeros)
-        let left_pad = config.left_pad_samples();
         for &s in &padded.samples[..left_pad] {
             assert_eq!(s, 0.0, "Left padding should be zeros");
         }
@@ -155,29 +170,27 @@ mod tests {
             "Total should be aligned to token boundary"
         );
 
-        // Check against known values from Python mistral-common:
+        // With 76-token left pad: 76 * 1280 = 97280 samples
         // Original: 255168 samples
-        // Left pad: 40960 samples (32 tokens)
-        // Total after left: 296128 samples
-        // Alignment pad: 832 samples (to reach 296960 = 232 tokens)
-        // Extra pad: 21760 samples (17 tokens for encoder alignment)
-        // Total: 318720 samples = 249 tokens
-        let expected_total = 40960 + 255168 + 832 + 21760;
+        // Total after left: 97280 + 255168 = 352448
+        // 352448 % 1280 = 448, alignment pad = 1280 - 448 = 832
+        // Extra pad: 17 * 1280 = 21760
+        // Total: 352448 + 832 + 21760 = 375040 samples = 293 tokens
+        let expected_total = 97280 + 255168 + 832 + 21760;
         assert_eq!(padded.samples.len(), expected_total);
-        assert_eq!(padded.samples.len(), 318720); // Match Python exactly
+        assert_eq!(padded.samples.len(), 375040);
 
         let num_tokens = num_audio_tokens(padded.samples.len(), &config);
-        assert_eq!(num_tokens, 249);
+        assert_eq!(num_tokens, 293);
     }
 
     #[test]
-    fn test_pad_matches_python() {
-        // Verify padding matches mistral-common's behavior exactly.
-        // From Python reference:
-        // - Original: 255168 samples (15.948s)
-        // - Left pad: 40960 samples (32 tokens)
+    fn test_pad_matches_expected() {
+        // Verify padding with 76-token left pad for Q4 robustness.
+        // With original 255168-sample audio:
+        // - Left pad: 97280 samples (76 tokens)
         // - Right pad: 22592 samples (alignment + 17 extra tokens)
-        // - Total: 318720 samples (249 tokens)
+        // - Total: 375040 samples (293 tokens)
 
         let config = PadConfig::voxtral();
         let audio = AudioBuffer {
@@ -186,28 +199,21 @@ mod tests {
         };
 
         let padded = pad_audio(&audio, &config);
+        let left_pad = config.left_pad_samples();
 
-        // Left padding: 32 tokens
-        assert_eq!(config.left_pad_samples(), 40960);
+        // Left padding: 76 tokens
+        assert_eq!(left_pad, 97280);
 
-        // Total samples must match Python exactly
-        assert_eq!(padded.samples.len(), 318720);
-
-        // Total tokens: 249
+        // Total: 293 tokens
         let tokens = num_audio_tokens(padded.samples.len(), &config);
-        assert_eq!(tokens, 249);
-        println!(
-            "Padded to {} samples = {} tokens",
-            padded.samples.len(),
-            tokens
-        );
+        assert_eq!(tokens, 293);
 
         // Verify the audio starts at the right position
-        assert_eq!(padded.samples[40960], 0.5); // First sample of original
-        assert_eq!(padded.samples[40959], 0.0); // Last sample of left pad
+        assert_eq!(padded.samples[left_pad], 0.5);
+        assert_eq!(padded.samples[left_pad - 1], 0.0);
 
         // Verify right padding is zeros
-        let right_pad_start = 40960 + 255168;
+        let right_pad_start = left_pad + 255168;
         assert_eq!(padded.samples[right_pad_start], 0.0);
     }
 }

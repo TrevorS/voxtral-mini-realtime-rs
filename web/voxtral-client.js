@@ -289,52 +289,42 @@ export class VoxtralClient {
     }
 
     async _decodeAudioFile(file) {
-        // Read file as ArrayBuffer
         const arrayBuffer = await file.arrayBuffer();
 
-        // Decode to AudioBuffer
-        const audioContext = new AudioContext({ sampleRate: this.targetSampleRate });
+        // Decode at native sample rate — don't force 16kHz on AudioContext
+        // (browsers can silently ignore the requested rate)
+        const audioContext = new AudioContext();
         const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+        await audioContext.close();
 
-        // Get mono channel (mix down if stereo)
-        let samples;
+        // Mix to mono
+        let mono;
         if (audioBuffer.numberOfChannels === 1) {
-            samples = audioBuffer.getChannelData(0);
+            mono = audioBuffer.getChannelData(0);
         } else {
-            // Mix stereo to mono
             const left = audioBuffer.getChannelData(0);
             const right = audioBuffer.getChannelData(1);
-            samples = new Float32Array(left.length);
+            mono = new Float32Array(left.length);
             for (let i = 0; i < left.length; i++) {
-                samples[i] = (left[i] + right[i]) / 2;
+                mono[i] = (left[i] + right[i]) / 2;
             }
         }
 
-        // Resample if needed
-        if (audioBuffer.sampleRate !== this.targetSampleRate) {
-            samples = this._resample(samples, audioBuffer.sampleRate, this.targetSampleRate);
+        // Resample to 16kHz using OfflineAudioContext (proper anti-aliased sinc resampling)
+        if (audioBuffer.sampleRate === this.targetSampleRate) {
+            return mono;
         }
 
-        await audioContext.close();
-        return samples;
-    }
-
-    _resample(samples, fromRate, toRate) {
-        const ratio = fromRate / toRate;
-        const newLength = Math.floor(samples.length / ratio);
-        const result = new Float32Array(newLength);
-
-        for (let i = 0; i < newLength; i++) {
-            const srcIndex = i * ratio;
-            const srcIndexFloor = Math.floor(srcIndex);
-            const srcIndexCeil = Math.min(srcIndexFloor + 1, samples.length - 1);
-            const t = srcIndex - srcIndexFloor;
-
-            // Linear interpolation
-            result[i] = samples[srcIndexFloor] * (1 - t) + samples[srcIndexCeil] * t;
-        }
-
-        return result;
+        const outLength = Math.ceil(mono.length * this.targetSampleRate / audioBuffer.sampleRate);
+        const offlineCtx = new OfflineAudioContext(1, outLength, this.targetSampleRate);
+        const srcBuf = offlineCtx.createBuffer(1, mono.length, audioBuffer.sampleRate);
+        srcBuf.getChannelData(0).set(mono);
+        const src = offlineCtx.createBufferSource();
+        src.buffer = srcBuf;
+        src.connect(offlineCtx.destination);
+        src.start(0);
+        const rendered = await offlineCtx.startRendering();
+        return rendered.getChannelData(0);
     }
 
     _stopMicrophone() {

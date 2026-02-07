@@ -62,6 +62,12 @@ Audio (16kHz mono)
 | Embeddings | f32 tensor (1.5 GiB) | Q4 on GPU (216 MB) + CPU bytes for lookups |
 | Browser | No | Yes (WASM + WebGPU) |
 
+### Q4 Padding Workaround
+
+The upstream mistral-common library left-pads audio with 32 silence tokens (at 12.5 Hz). After the mel/conv/reshape pipeline, this covers only 16 of the 38 decoder prefix positions with silence — the remaining 22 contain actual audio. The f32 model handles this fine, but Q4_0 quantization makes the decoder sensitive to speech content in the prefix: audio that starts immediately with speech (mic recordings, clips with no leading silence) produces all-pad tokens instead of text.
+
+We increase the left padding to 76 tokens, which maps to exactly 38 decoder tokens of silence and covers the full streaming prefix. See [`src/audio/pad.rs`](src/audio/pad.rs) for details.
+
 ### WASM Constraints Solved
 
 Running a 4B model in a browser tab required solving five hard constraints:
@@ -98,7 +104,7 @@ wasm-pack build --target web --no-default-features --features wasm
 ## Testing
 
 ```bash
-# Unit + integration tests (103 tests)
+# Unit + integration tests (107 tests)
 cargo test --features "wgpu,cli,hub"
 
 # Lint

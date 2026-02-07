@@ -282,6 +282,10 @@ impl<B: Backend> VoxtralModel<B> {
     /// **Solution**: Use prefix length **38** (one less than standard) for generation.
     /// Position 37 correctly predicts `[STREAMING_WORD]` and transcription works.
     ///
+    /// Note: `n_left_pad_tokens` in the upstream config is 32, but audio padding
+    /// uses 76 tokens at 12.5 Hz to cover the full 38-token decoder prefix with
+    /// silence. See `PadConfig` in `audio::pad` for why this is needed for Q4.
+    ///
     /// # Token Meanings
     ///
     /// - `32` = `[STREAMING_PAD]` - silence/pause between words

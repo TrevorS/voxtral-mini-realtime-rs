@@ -549,9 +549,13 @@ mod tests {
             return;
         }
 
-        // Load and pad audio
+        // Load and pad audio using the original 32-token left pad to match
+        // the Python reference (generated with mistral-common defaults).
         let audio = load_wav(audio_path).expect("Failed to load audio");
-        let pad_config = PadConfig::voxtral();
+        let pad_config = PadConfig {
+            n_left_pad_tokens: 32,
+            ..PadConfig::voxtral()
+        };
         let padded = pad_audio(&audio, &pad_config);
 
         // Compute mel

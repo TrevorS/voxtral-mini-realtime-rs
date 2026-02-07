@@ -24,7 +24,7 @@ cargo clippy --no-default-features --features wasm --target wasm32-unknown-unkno
 cargo fmt
 cargo fmt -- --check
 
-# Tests (103 tests: 100 unit + 3 integration)
+# Tests (107 tests: 104 unit + 3 integration)
 cargo test --features "wgpu,cli,hub"
 cargo test test_q4_roundtrip_small           # single test
 cargo test gguf::tests                        # module tests
@@ -61,8 +61,8 @@ The `wasm` feature enables both `wgpu` (for burn's WebGPU backend) and `dep:wgpu
 # F32 SafeTensors (~9 GB)
 uv run --with huggingface_hub hf download mistralai/Voxtral-Mini-4B-Realtime-2602 --local-dir models/voxtral
 
-# Q4 GGUF (~2.5 GB) — convert from safetensors or download pre-quantized
-# Expected: models/voxtral-q4.gguf
+# Q4 GGUF (~2.5 GB)
+uv run --with huggingface_hub hf download TrevorJS/voxtral-mini-realtime-gguf voxtral-q4.gguf --local-dir models
 
 # Sharded for WASM (5 × ≤512 MB each)
 # Expected: models/voxtral-q4-shards/shard-{aa..ae}
@@ -110,6 +110,7 @@ reader.rs (GGUF parser + ShardedCursor)
 | Mel: 128 bins, hop 160, conv 4× downsample → 12.5 Hz frame rate |
 | Vocab: 131,072 (Tekken tokenizer) |
 | Streaming: 38-token prefix (BOS + 37 pad), lookahead t=6 (480ms) |
+| Left pad: 76 tokens at 12.5 Hz (Q4 workaround; upstream default is 32) |
 
 ## WASM Constraints & Workarounds
 

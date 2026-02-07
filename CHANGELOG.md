@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Q4 inference fails on audio without leading silence.** The Q4_0 quantized
+  model is sensitive to speech content in the 38-token streaming prefix. Audio
+  that starts immediately with speech (e.g. mic recordings with no silence)
+  produced all-pad tokens and "no speech detected." Increased left padding from
+  32 to 76 tokens so the full prefix sees only silence. The upstream
+  mistral-common default of 32 works for f32 inference but is insufficient for
+  Q4. ([details in `src/audio/pad.rs`](src/audio/pad.rs))
+
+### Changed
+
+- HuggingFace Space deployment (static SDK, model shards fetched from CDN)
+- Browser UI redesign with weights caching via Cache API
+- Audio resampling in browser uses `OfflineAudioContext` for correct 16 kHz conversion
+
 ## 0.1.0
 
 Initial release of Voxtral Mini 4B Realtime in Rust.
