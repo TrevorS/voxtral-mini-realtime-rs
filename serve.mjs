@@ -28,8 +28,8 @@ const MIME = {
 };
 
 const TLS = {
-  key:  readFileSync("/tmp/voxtral-key.pem"),
-  cert: readFileSync("/tmp/voxtral-cert.pem"),
+  key:  readFileSync(process.env.VOXTRAL_TLS_KEY  ?? "/tmp/voxtral-key.pem"),
+  cert: readFileSync(process.env.VOXTRAL_TLS_CERT ?? "/tmp/voxtral-cert.pem"),
 };
 
 // Discover model shards

@@ -12,17 +12,12 @@ use std::io::BufReader;
 use std::path::Path;
 
 /// Tekken tokenizer configuration from JSON.
+///
+/// Only the fields we need are deserialized; serde silently ignores the rest
+/// (`pattern`, `num_vocab_tokens`, `default_num_special_tokens`, `version`).
 #[derive(Debug, Deserialize)]
 struct TekkenConfig {
-    #[allow(dead_code)]
-    pattern: String,
-    #[allow(dead_code)]
-    num_vocab_tokens: usize,
     default_vocab_size: usize,
-    #[allow(dead_code)]
-    default_num_special_tokens: usize,
-    #[allow(dead_code)]
-    version: String,
 }
 
 /// Single vocabulary entry.

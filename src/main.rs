@@ -1,4 +1,4 @@
 fn main() {
-    println!("Voxtral Mini 4B Realtime - Rust port with Burn");
-    println!("Run with --help for usage (requires 'cli' feature)");
+    eprintln!("Voxtral Mini 4B Realtime - Streaming ASR in Rust with Burn");
+    eprintln!("Usage: cargo run --features \"wgpu,cli,hub\" --bin voxtral-transcribe -- --help");
 }

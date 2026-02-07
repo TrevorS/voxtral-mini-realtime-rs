@@ -5,6 +5,7 @@ Cargo.lock
 .DS_Store
 node_modules/
 bun.lock
+pkg/
 test-results/
 playwright-report/
 
