@@ -764,6 +764,7 @@ impl Q4VoxtralModel {
 
     /// Encode audio to hidden states ready for the LLM.
     pub fn encode_audio(&self, mel: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
+        let _span = tracing::info_span!("encode_audio").entered();
         let encoder_out = self.encoder.forward(mel, 0);
         let reshaped = reshape_encoder_output(encoder_out, self.reshape_factor);
         self.adapter.forward(reshaped)
@@ -857,6 +858,7 @@ impl Q4VoxtralModel {
         mel: Tensor<Wgpu, 3>,
         t_embed_decoder: Tensor<Wgpu, 3>,
     ) -> Vec<i32> {
+        let _span = tracing::info_span!("transcribe_streaming").entered();
         let device = mel.device();
 
         let audio_embeds = self.encode_audio(mel);
@@ -884,11 +886,14 @@ impl Q4VoxtralModel {
 
         let mut decoder_cache = self.create_decoder_cache();
 
-        let hidden = self.decoder.forward_hidden_with_cache(
-            prefix_inputs,
-            t_embed_decoder.clone(),
-            &mut decoder_cache,
-        );
+        let hidden = {
+            let _prefill = tracing::info_span!("prefill").entered();
+            self.decoder.forward_hidden_with_cache(
+                prefix_inputs,
+                t_embed_decoder.clone(),
+                &mut decoder_cache,
+            )
+        };
         let logits = self.decoder.lm_head(hidden);
 
         let last_logits =
@@ -901,6 +906,8 @@ impl Q4VoxtralModel {
         let mut generated = prefix;
         generated.push(first_token);
 
+        let _decode_span =
+            tracing::info_span!("decode", tokens = seq_len - PREFIX_LEN - 1).entered();
         for pos in (PREFIX_LEN + 1)..seq_len {
             let new_token = generated[pos - 1];
             let token_tensor = Tensor::<Wgpu, 2, Int>::from_data(
