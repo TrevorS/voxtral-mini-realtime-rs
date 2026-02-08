@@ -1,10 +1,11 @@
 # Voxtral Mini 4B Realtime (Rust)
 
 [![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97-Model_on_HuggingFace-yellow)](https://huggingface.co/TrevorJS/voxtral-mini-realtime-gguf)
+[![Live Demo](https://img.shields.io/badge/%F0%9F%94%8A-Live_Demo-blue)](https://huggingface.co/spaces/TrevorJS/voxtral-mini-realtime)
 
 Streaming speech recognition running natively and in the browser. A pure Rust implementation of [Mistral's Voxtral Mini 4B Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) model using the [Burn](https://burn.dev) ML framework.
 
-The Q4 GGUF quantized path (2.5 GB) runs entirely client-side in a browser tab via WASM + WebGPU.
+The Q4 GGUF quantized path (2.5 GB) runs entirely client-side in a browser tab via WASM + WebGPU. [Try it live.](https://huggingface.co/spaces/TrevorJS/voxtral-mini-realtime)
 
 ## Quick Start
 
@@ -41,16 +42,18 @@ bun serve.mjs
 
 Open `https://localhost:8443`, accept the certificate, and click **Load from Server** to download the model shards. Record from your microphone or upload a WAV file to transcribe.
 
+[Hosted demo on HuggingFace Spaces](https://huggingface.co/spaces/TrevorJS/voxtral-mini-realtime) if you want to skip local setup.
+
 ## Architecture
 
 ```
 Audio (16kHz mono)
-  → Mel spectrogram [B, 128, T]
-    → Causal encoder (32 layers, 1280 dim, sliding window 750)
-      → Conv 4x downsample → Reshape [B, T/16, 5120]
-        → Adapter [B, T/16, 3072]
-          → Autoregressive decoder (26 layers, 3072 dim, GQA 32Q/8KV)
-            → Token IDs → Text
+  -> Mel spectrogram [B, 128, T]
+    -> Causal encoder (32 layers, 1280 dim, sliding window 750)
+      -> Conv 4x downsample -> Reshape [B, T/16, 5120]
+        -> Adapter [B, T/16, 3072]
+          -> Autoregressive decoder (26 layers, 3072 dim, GQA 32Q/8KV)
+            -> Token IDs -> Text
 ```
 
 ### Two Inference Paths
@@ -66,7 +69,7 @@ Audio (16kHz mono)
 
 The upstream mistral-common library left-pads audio with 32 silence tokens (at 12.5 Hz). After the mel/conv/reshape pipeline, this covers only 16 of the 38 decoder prefix positions with silence — the remaining 22 contain actual audio. The f32 model handles this fine, but Q4_0 quantization makes the decoder sensitive to speech content in the prefix: audio that starts immediately with speech (mic recordings, clips with no leading silence) produces all-pad tokens instead of text.
 
-We increase the left padding to 76 tokens, which maps to exactly 38 decoder tokens of silence and covers the full streaming prefix. See [`src/audio/pad.rs`](src/audio/pad.rs) for details.
+The left padding is increased to 76 tokens, which maps to exactly 38 decoder tokens of silence and covers the full streaming prefix. See [`src/audio/pad.rs`](src/audio/pad.rs) for details.
 
 ### WASM Constraints Solved
 
@@ -104,7 +107,7 @@ wasm-pack build --target web --no-default-features --features wasm
 ## Testing
 
 ```bash
-# Unit + integration tests (107 tests)
+# Unit + integration tests (requires GPU for full suite)
 cargo test --features "wgpu,cli,hub"
 
 # Lint
@@ -114,6 +117,8 @@ cargo clippy --no-default-features --features wasm --target wasm32-unknown-unkno
 # E2E browser test (requires Playwright + model shards)
 bunx playwright test tests/e2e_browser.spec.ts
 ```
+
+GPU-dependent tests (model layer shapes, Q4 matmul, WGSL shader correctness) are skipped in CI since GitHub Actions runners lack a GPU adapter. These tests run locally on any machine with Vulkan, Metal, or WebGPU support.
 
 ## Model Preparation
 
@@ -126,6 +131,10 @@ split -b 512m models/voxtral-q4.gguf models/voxtral-q4-shards/shard-
 ```
 
 The dev server and E2E test discover shards automatically from `models/voxtral-q4-shards/`.
+
+## Benchmarks
+
+Coming soon: accuracy (WER) and inference speed benchmarks across native and browser targets.
 
 ## Project Structure
 
@@ -140,6 +149,7 @@ src/
 
 web/              # Browser demo: index.html, worker.js, voxtral-client.js
 tests/            # Integration tests + Playwright E2E spec
+scripts/          # Dev scripts: reference implementations, weight inspection, E2E helpers
 patches/          # cubecl-wgpu workgroup size fix for WebGPU
 ```
 

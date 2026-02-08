@@ -21,5 +21,7 @@ patches/**/Cargo.toml.orig
 # Test data
 test_data/
 
-# Large test audio files
+# Dev test audio files (not part of test suite)
 test_long.wav
+test_audio.wav
+test_genesis.wav

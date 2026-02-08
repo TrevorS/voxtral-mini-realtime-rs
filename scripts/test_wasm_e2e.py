@@ -210,7 +210,7 @@ def test_transcription_with_model():
     project_root = Path(__file__).parent.parent
     model_path = project_root / "models" / "voxtral" / "consolidated.safetensors"
     tokenizer_path = project_root / "models" / "voxtral" / "tekken.json"
-    audio_path = project_root / "test_genesis.wav"
+    audio_path = project_root / "test_data" / "test_genesis.wav"
 
     if not model_path.exists():
         print("⏭️  Skipping transcription test: model not found")
