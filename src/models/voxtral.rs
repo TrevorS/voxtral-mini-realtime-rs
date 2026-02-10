@@ -314,6 +314,10 @@ impl<B: Backend> VoxtralModel<B> {
         const BOS_TOKEN: i32 = 1;
         const STREAMING_PAD: i32 = 32;
 
+        if seq_len < PREFIX_LEN {
+            return Vec::new();
+        }
+
         // Build prefix: BOS + 37 STREAMING_PAD = 38 tokens
         let mut prefix: Vec<i32> = vec![BOS_TOKEN];
         prefix.extend(std::iter::repeat_n(STREAMING_PAD, PREFIX_LEN - 1));
