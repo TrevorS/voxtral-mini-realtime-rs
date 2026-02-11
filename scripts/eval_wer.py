@@ -2,8 +2,9 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "datasets",
+#     "datasets<3",
 #     "jiwer",
+#     "librosa",
 #     "soundfile",
 # ]
 # ///
@@ -11,7 +12,7 @@
 WER evaluation for Voxtral Mini 4B Realtime.
 
 Evaluates word error rate against standard ASR datasets by running the
-compiled voxtral-transcribe binary on each utterance.
+compiled voxtral-transcribe binary in batch mode (model loads once).
 
 Primary: FLEURS English (en_us) test set — 350 sentences, ~12 min total.
   Mistral benchmark: 4.90% WER at 480ms delay.
@@ -19,8 +20,8 @@ Primary: FLEURS English (en_us) test set — 350 sentences, ~12 min total.
 Secondary: LibriSpeech test-clean — 2,620 utterances, ~5 hours.
 
 Usage:
-    uv run --script scripts/eval_wer.py -- \\
-        --dataset fleurs --gguf models/voxtral-q4.gguf \\
+    uv run --script scripts/eval_wer.py -- \
+        --dataset fleurs --gguf models/voxtral-q4.gguf \
         --tokenizer models/voxtral/tekken.json --delay 6
 """
 
@@ -28,6 +29,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -37,6 +40,14 @@ from pathlib import Path
 
 import jiwer
 import soundfile as sf
+
+# Work around root-owned default HF cache on some systems
+if "HF_DATASETS_CACHE" not in os.environ:
+    default_cache = Path.home() / ".cache" / "huggingface" / "datasets"
+    if default_cache.exists() and not os.access(default_cache, os.W_OK):
+        os.environ["HF_DATASETS_CACHE"] = str(Path(tempfile.gettempdir()) / "hf_datasets")
+
+BINARY = "target/release/voxtral-transcribe"
 
 
 @dataclass
@@ -63,62 +74,20 @@ class EvalReport:
     utterances: list[UtteranceResult] = field(default_factory=list)
 
 
-def build_transcribe_cmd(
-    audio_path: str,
-    gguf: str | None,
-    model: str | None,
-    tokenizer: str | None,
-    delay: int,
-) -> list[str]:
-    cmd = [
-        "cargo",
-        "run",
-        "--release",
-        "--features",
-        "wgpu,cli",
-        "--bin",
-        "voxtral-transcribe",
-        "--",
-        "--audio",
-        audio_path,
-        "--delay",
-        str(delay),
-    ]
-    if gguf:
-        cmd.extend(["--gguf", gguf])
-        if tokenizer:
-            cmd.extend(["--tokenizer", tokenizer])
-    elif model:
-        cmd.extend(["--model", model])
-        if tokenizer:
-            cmd.extend(["--tokenizer", tokenizer])
-    return cmd
-
-
-def transcribe(
-    audio_path: str,
-    gguf: str | None,
-    model: str | None,
-    tokenizer: str | None,
-    delay: int,
-) -> str | None:
-    cmd = build_transcribe_cmd(audio_path, gguf, model, tokenizer, delay)
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if result.returncode != 0:
-            print(f"  ERROR: {result.stderr.strip()[:200]}", file=sys.stderr)
-            return None
-        # The transcription is the last non-empty line of stdout
-        lines = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
-        return lines[-1] if lines else None
-    except subprocess.TimeoutExpired:
-        print("  ERROR: transcription timed out", file=sys.stderr)
-        return None
+def ensure_binary() -> str:
+    """Find or build the release binary."""
+    if Path(BINARY).exists():
+        return BINARY
+    print("Release binary not found, building...")
+    result = subprocess.run(
+        ["cargo", "build", "--release", "--features", "wgpu,cli"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"Build failed:\n{result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    return BINARY
 
 
 def normalize_text(text: str) -> str:
@@ -129,7 +98,7 @@ def normalize_text(text: str) -> str:
 
 
 def load_fleurs(split: str = "test") -> list[tuple[str, any, str]]:
-    """Load FLEURS English test set. Returns [(id, audio_array, reference_text)]."""
+    """Load FLEURS English test set. Returns [(id, audio_dict, reference_text)]."""
     from datasets import load_dataset
 
     print(f"Loading FLEURS en_us {split} set...")
@@ -146,7 +115,6 @@ def load_librispeech(split: str = "test.clean") -> list[tuple[str, any, str]]:
     """Load LibriSpeech test-clean. Returns [(id, audio_dict, reference_text)]."""
     from datasets import load_dataset
 
-    # Map user-friendly name to HF split name
     split_map = {
         "test-clean": "test.clean",
         "test.clean": "test.clean",
@@ -156,9 +124,7 @@ def load_librispeech(split: str = "test.clean") -> list[tuple[str, any, str]]:
     hf_split = split_map.get(split, split)
 
     print(f"Loading LibriSpeech {hf_split}...")
-    ds = load_dataset(
-        "openslr/librispeech_asr", split=hf_split, trust_remote_code=True
-    )
+    ds = load_dataset("openslr/librispeech_asr", split=hf_split, trust_remote_code=True)
     items = []
     for row in ds:
         audio = row["audio"]
@@ -169,44 +135,101 @@ def load_librispeech(split: str = "test.clean") -> list[tuple[str, any, str]]:
 
 def evaluate(
     items: list[tuple[str, any, str]],
+    binary: str,
     gguf: str | None,
     model: str | None,
     tokenizer: str | None,
     delay: int,
     dataset_name: str,
 ) -> EvalReport:
+    tmpdir = Path(tempfile.mkdtemp(prefix="voxtral_wer_"))
+
+    try:
+        return _evaluate_batch(items, binary, gguf, model, tokenizer, delay, dataset_name, tmpdir)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _evaluate_batch(
+    items: list[tuple[str, any, str]],
+    binary: str,
+    gguf: str | None,
+    model: str | None,
+    tokenizer: str | None,
+    delay: int,
+    dataset_name: str,
+    tmpdir: Path,
+) -> EvalReport:
+    # Phase 1: Write all audio to temp WAV files
+    print(f"Preparing {len(items)} audio files...")
+    wav_paths: list[Path] = []
+    durations: list[float] = []
+    for i, (uid, audio, _ref_text) in enumerate(items):
+        wav_path = tmpdir / f"{i:05d}.wav"
+        audio_array = audio["array"]
+        sr = audio["sampling_rate"]
+        sf.write(str(wav_path), audio_array, sr)
+        durations.append(len(audio_array) / sr)
+        wav_paths.append(wav_path)
+
+    total_audio_secs = sum(durations)
+    print(f"  {total_audio_secs:.0f}s of audio ({total_audio_secs / 60:.1f} min)")
+
+    # Phase 2: Write audio list file
+    list_file = tmpdir / "audio_list.txt"
+    list_file.write_text("\n".join(str(p) for p in wav_paths) + "\n")
+
+    # Phase 3: Run binary once with --audio-list (model loads once)
+    cmd = [binary, "--audio-list", str(list_file), "--delay", str(delay)]
+    if gguf:
+        cmd.extend(["--gguf", gguf])
+        if tokenizer:
+            cmd.extend(["--tokenizer", tokenizer])
+    elif model:
+        cmd.extend(["--model", model])
+        if tokenizer:
+            cmd.extend(["--tokenizer", tokenizer])
+
+    # Timeout: 2x audio duration + 5 min for model loading, minimum 10 min
+    timeout_secs = max(600, int(total_audio_secs * 2) + 300)
+    print(f"Running batch transcription ({len(items)} files, model loads once, "
+          f"timeout={timeout_secs}s)...")
+    wall_start = time.time()
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout_secs,
+    )
+    wall_secs = time.time() - wall_start
+
+    if result.returncode != 0:
+        print(f"Transcription failed:\n{result.stderr[:500]}", file=sys.stderr)
+        sys.exit(1)
+
+    # Phase 4: Parse output — one transcription per line, matching input order.
+    # stdout has exactly one line per audio file (some may be empty). Tracing → stderr.
+    # Remove only the single trailing newline from the last println!, keep empty lines.
+    raw_output = result.stdout
+    if raw_output.endswith("\n"):
+        raw_output = raw_output[:-1]
+    hyp_lines = raw_output.split("\n") if raw_output else []
+
+    if len(hyp_lines) != len(items):
+        print(
+            f"WARNING: Expected {len(items)} transcriptions, got {len(hyp_lines)}",
+            file=sys.stderr,
+        )
+
+    # Phase 5: Compute WER per utterance
     results: list[UtteranceResult] = []
     references: list[str] = []
     hypotheses: list[str] = []
     failed = 0
-    total_audio_secs = 0.0
 
-    wall_start = time.time()
-
-    for i, (uid, audio, ref_text) in enumerate(items):
-        # Write audio to temp WAV file
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-            audio_array = audio["array"]
-            sr = audio["sampling_rate"]
-            sf.write(tmp_path, audio_array, sr)
-            audio_dur = len(audio_array) / sr
-
-        total_audio_secs += audio_dur
-
-        print(
-            f"  [{i + 1}/{len(items)}] {uid} ({audio_dur:.1f}s)...",
-            end="",
-            flush=True,
-        )
-
-        hyp = transcribe(tmp_path, gguf, model, tokenizer, delay)
-        Path(tmp_path).unlink(missing_ok=True)
-
-        if hyp is None:
-            failed += 1
-            print(" FAILED")
-            continue
+    for i, (uid, _audio, ref_text) in enumerate(items):
+        hyp = hyp_lines[i].strip() if i < len(hyp_lines) else ""
 
         ref_norm = normalize_text(ref_text)
         hyp_norm = normalize_text(hyp)
@@ -222,15 +245,14 @@ def evaluate(
                 reference=ref_text,
                 hypothesis=hyp,
                 wer=utt_wer,
-                audio_duration_secs=audio_dur,
+                audio_duration_secs=durations[i],
             )
         )
         references.append(ref_norm)
         hypotheses.append(hyp_norm)
 
-        print(f" WER={utt_wer:.1%}")
-
-    wall_secs = time.time() - wall_start
+        status = f"WER={utt_wer:.0%}" if utt_wer > 0 else "OK"
+        print(f"  [{i + 1}/{len(items)}] {uid} ({durations[i]:.1f}s) {status}")
 
     # Aggregate WER/CER
     if references:
@@ -327,6 +349,8 @@ def main() -> None:
     if not args.gguf and not args.model:
         parser.error("Either --gguf or --model is required")
 
+    binary = ensure_binary()
+
     # Load dataset
     if args.dataset == "fleurs":
         items = load_fleurs()
@@ -343,6 +367,7 @@ def main() -> None:
     # Run evaluation
     report = evaluate(
         items,
+        binary=binary,
         gguf=args.gguf,
         model=args.model,
         tokenizer=args.tokenizer,

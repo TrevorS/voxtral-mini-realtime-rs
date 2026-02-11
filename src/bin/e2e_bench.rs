@@ -102,11 +102,12 @@ fn preprocess_audio(
     let audio = load_wav(audio_path).context("Failed to load audio")?;
     let audio_duration = audio.duration_secs();
 
-    let audio = if audio.sample_rate != 16000 {
+    let mut audio = if audio.sample_rate != 16000 {
         resample_to_16k(&audio).context("Failed to resample")?
     } else {
         audio
     };
+    audio.peak_normalize(0.95);
 
     let pad_config = PadConfig::voxtral();
     let padded = pad_audio(&audio, &pad_config);

@@ -248,11 +248,14 @@ impl VoxtralQ4 {
             .as_ref()
             .ok_or("Tokenizer not loaded. Call loadModel first.")?;
 
-        // Create audio buffer (assumes 16kHz input)
-        let audio_buf = AudioBuffer {
+        // Create audio buffer (assumes 16kHz input) and normalize peak amplitude.
+        // Q4 quantization can't resolve subtle mel features from quiet audio, so
+        // we normalize to ensure the mel spectrogram is well above the noise floor.
+        let mut audio_buf = AudioBuffer {
             samples: audio.to_vec(),
             sample_rate: 16000,
         };
+        audio_buf.peak_normalize(0.95);
 
         // Apply padding for streaming alignment
         let padded = pad_audio(&audio_buf, &self.pad_config);
@@ -331,7 +334,7 @@ impl VoxtralQ4 {
             return Ok(Vec::new());
         }
 
-        let mut decoder_cache = model.create_decoder_cache_preallocated(seq_len);
+        let mut decoder_cache = model.decoder().create_cache();
 
         // Build prefix: BOS + 37 STREAMING_PAD
         let mut prefix: Vec<i32> = vec![BOS_TOKEN];

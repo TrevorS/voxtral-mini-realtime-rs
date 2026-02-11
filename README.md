@@ -5,6 +5,22 @@
 
 Streaming speech recognition running natively and in the browser. A pure Rust implementation of [Mistral's Voxtral Mini 4B Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) model using the [Burn](https://burn.dev) ML framework.
 
+## Benchmarks
+
+NVIDIA DGX Spark (GB10, LPDDR5x), 16s test audio, 3-run average:
+
+| Path | Encode | Decode | Total | RTF | Tok/s | Memory |
+|------|--------|--------|-------|-----|-------|--------|
+| **Q4 GGUF native** | 1021 ms | 5578 ms | 6629 ms | **0.416** | **19.4** | 703 MB |
+| F32 native | 887 ms | 23689 ms | 24607 ms | 1.543 | 4.6 | 9.2 GB |
+| Q4 GGUF WASM | — | — | ~225 s | ~14.1 | ~0.5 | (browser) |
+
+- **RTF** (Real-Time Factor): 0.416 means transcription completes in under half the audio duration
+- Q4 decode is **4.2× faster** than F32 — fused dequant+matmul avoids materializing 9 GB of weights
+- Custom WGSL compute shaders with vectorized u32 reads and vec4 dot products
+- Dual-path kernel dispatch: shared-memory tiled kernel (compile-time constants) for single-token decode, naive kernel for multi-row encode/prefill
+- **8.49% WER** on FLEURS English (647 utterances), vs. Mistral's reported 4.90% at f32
+
 The Q4 GGUF quantized path (2.5 GB) runs entirely client-side in a browser tab via WASM + WebGPU. [Try it live.](https://huggingface.co/spaces/TrevorJS/voxtral-mini-realtime)
 
 ## Quick Start
@@ -131,10 +147,6 @@ split -b 512m models/voxtral-q4.gguf models/voxtral-q4-shards/shard-
 ```
 
 The dev server and E2E test discover shards automatically from `models/voxtral-q4-shards/`.
-
-## Benchmarks
-
-Coming soon: accuracy (WER) and inference speed benchmarks across native and browser targets.
 
 ## Project Structure
 
