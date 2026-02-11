@@ -884,6 +884,10 @@ impl Q4VoxtralModel {
         const BOS_TOKEN: i32 = 1;
         const STREAMING_PAD: i32 = 32;
 
+        if seq_len < PREFIX_LEN {
+            return Vec::new();
+        }
+
         let mut prefix: Vec<i32> = vec![BOS_TOKEN];
         prefix.extend(std::iter::repeat_n(STREAMING_PAD, PREFIX_LEN - 1));
 
