@@ -192,7 +192,7 @@ fn transcribe_f32(
         return Ok(Vec::new());
     }
 
-    let mut decoder_cache = model.create_decoder_cache();
+    let mut decoder_cache = model.create_decoder_cache_preallocated(seq_len, device);
 
     let mut prefix: Vec<i32> = vec![BOS_TOKEN];
     prefix.extend(std::iter::repeat_n(STREAMING_PAD, PREFIX_LEN - 1));

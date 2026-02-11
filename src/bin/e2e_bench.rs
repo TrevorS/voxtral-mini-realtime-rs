@@ -175,18 +175,16 @@ fn bench_q4(
     let mut prefix: Vec<i32> = vec![BOS_TOKEN];
     prefix.extend(std::iter::repeat_n(STREAMING_PAD, PREFIX_LEN - 1));
 
-    let prefix_tensor = Tensor::<Backend, 2, Int>::from_data(
-        TensorData::new(prefix.clone(), [1, PREFIX_LEN]),
-        device,
-    );
-    let prefix_text_embeds = model.decoder().embed_tokens(prefix_tensor);
+    let prefix_text_embeds = model
+        .decoder()
+        .embed_tokens_from_ids(&prefix, 1, PREFIX_LEN);
 
     let prefix_audio = audio_embeds
         .clone()
         .slice([0..1, 0..PREFIX_LEN, 0..d_model]);
     let prefix_inputs = prefix_audio + prefix_text_embeds;
 
-    let mut decoder_cache = model.create_decoder_cache();
+    let mut decoder_cache = model.create_decoder_cache_preallocated(seq_len);
 
     let hidden = model.decoder().forward_hidden_with_cache(
         prefix_inputs,
@@ -205,15 +203,17 @@ fn bench_q4(
     let mut generated = prefix;
     generated.push(first_token);
 
+    // Pre-slice audio positions to avoid cloning full audio_embeds each step
+    let audio_slices: Vec<Tensor<Backend, 3>> = (PREFIX_LEN..seq_len)
+        .map(|pos| audio_embeds.clone().slice([0..1, pos..pos + 1, 0..d_model]))
+        .collect();
+    drop(audio_embeds);
+
     for pos in (PREFIX_LEN + 1)..seq_len {
         let new_token = generated[pos - 1];
-        let token_tensor =
-            Tensor::<Backend, 2, Int>::from_data(TensorData::new(vec![new_token], [1, 1]), device);
-        let text_embed = model.decoder().embed_tokens(token_tensor);
+        let text_embed = model.decoder().embed_tokens_from_ids(&[new_token], 1, 1);
 
-        let audio_pos = audio_embeds
-            .clone()
-            .slice([0..1, (pos - 1)..pos, 0..d_model]);
+        let audio_pos = audio_slices[pos - 1 - PREFIX_LEN].clone();
         let input = audio_pos + text_embed;
 
         let hidden =

@@ -334,8 +334,9 @@ impl<B: Backend> VoxtralModel<B> {
         // Combine for prefix
         let prefix_inputs = prefix_audio + prefix_text_embeds;
 
-        // Create KV cache for decoder - enables O(n) inference instead of O(n²)
-        let mut decoder_cache = self.create_decoder_cache();
+        // Pre-allocate KV cache to the known sequence length to avoid
+        // growing Tensor::cat allocations per decode step.
+        let mut decoder_cache = self.decoder.create_cache_preallocated(seq_len, &device);
 
         // Run forward for prefix (fills cache with PREFIX_LEN positions)
         let hidden = self.decoder.forward_hidden_with_cache(
@@ -412,6 +413,15 @@ impl<B: Backend> VoxtralModel<B> {
     /// Create KV caches for the decoder.
     pub fn create_decoder_cache(&self) -> LayerCaches<B> {
         self.decoder.create_cache()
+    }
+
+    /// Create pre-allocated KV caches for the decoder.
+    pub fn create_decoder_cache_preallocated(
+        &self,
+        max_seq: usize,
+        device: &B::Device,
+    ) -> LayerCaches<B> {
+        self.decoder.create_cache_preallocated(max_seq, device)
     }
 
     /// Decompose model into its parts (for quantization).

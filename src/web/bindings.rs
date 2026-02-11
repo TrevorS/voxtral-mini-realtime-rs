@@ -331,7 +331,7 @@ impl VoxtralQ4 {
             return Ok(Vec::new());
         }
 
-        let mut decoder_cache = model.create_decoder_cache();
+        let mut decoder_cache = model.create_decoder_cache_preallocated(seq_len);
 
         // Build prefix: BOS + 37 STREAMING_PAD
         let mut prefix: Vec<i32> = vec![BOS_TOKEN];

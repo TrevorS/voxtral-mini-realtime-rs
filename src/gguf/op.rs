@@ -16,24 +16,24 @@ use cubecl::CubeTask;
 
 use super::tensor::Q4Tensor;
 
-const WG_X: u32 = 16;
-const WG_Y: u32 = 16;
+/// Workgroup size for the N (output column) dimension.
+/// Each thread computes one output element; the workgroup cooperatively
+/// loads the input tile into shared memory.
+const WG_X: u32 = 64;
 
-/// WGSL kernel source for Q4_0 dequant+matmul.
+/// WGSL kernel source for Q4_0 dequant+matmul with shared memory tiling.
 struct Q4MatmulKernel {
     workgroup_size_x: u32,
-    workgroup_size_y: u32,
 }
 
 impl KernelSource for Q4MatmulKernel {
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("shader.wgsl"))
             .register("workgroup_size_x", self.workgroup_size_x.to_string())
-            .register("workgroup_size_y", self.workgroup_size_y.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info(self.workgroup_size_x * 1000 + self.workgroup_size_y)
+        KernelId::new::<Self>().info(self.workgroup_size_x)
     }
 }
 
@@ -63,22 +63,22 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
     let client = cube_input.client.clone();
     let device = cube_input.device.clone();
 
-    // Info buffer: [B, M, K, N, num_blocks_per_row]
-    let total_blocks = (k * n) / 32;
-    let info: [u32; 5] = [b as u32, m as u32, k as u32, n as u32, total_blocks as u32];
+    // Info buffer: [B, M, K, N, blocks_per_row]
+    let blocks_per_row = k / 32;
+    let info: [u32; 5] = [b as u32, m as u32, k as u32, n as u32, blocks_per_row as u32];
     let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
     let info_handle = client.create_from_slice(&info_bytes);
 
     // Allocate output buffer (B × M × N × 4 bytes for f32)
     let output_handle = client.empty(b * m * n * 4);
 
-    // Create kernel
+    // Create kernel — workgroup_size(WG_X, 1, 1); Y=1 because each row
+    // of the output (each bm value) maps to separate workgroups.
     let kernel = SourceKernel::new(
         Q4MatmulKernel {
             workgroup_size_x: WG_X,
-            workgroup_size_y: WG_Y,
         },
-        CubeDim::new_2d(WG_X, WG_Y),
+        CubeDim::new_1d(WG_X),
     );
 
     // Bindings must match WGSL @binding order:
@@ -92,9 +92,9 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
         .with_buffer(output_handle.clone().binding())
         .with_buffer(info_handle.binding());
 
-    // Workgroup dispatch: x=ceil(N/WG_X), y=ceil(B*M/WG_Y)
+    // Workgroup dispatch: x=ceil(N/WG_X), y=B*M (one row per workgroup in Y)
     let wg_count_x = n.div_ceil(WG_X as usize) as u32;
-    let wg_count_y = (b * m).div_ceil(WG_Y as usize) as u32;
+    let wg_count_y = (b * m) as u32;
 
     // Launch
     client
