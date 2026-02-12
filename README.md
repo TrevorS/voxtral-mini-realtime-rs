@@ -18,7 +18,7 @@ NVIDIA DGX Spark (GB10, LPDDR5x), 16s test audio, 3-run average:
 - **RTF** (Real-Time Factor): 0.416 means transcription completes in under half the audio duration
 - Q4 decode is **4.2× faster** than F32 — fused dequant+matmul avoids materializing 9 GB of weights
 - Custom WGSL compute shaders with vectorized u32 reads and vec4 dot products
-- Dual-path kernel dispatch: shared-memory tiled kernel (compile-time constants) for single-token decode, naive kernel for multi-row encode/prefill
+- Dual-path kernel dispatch: shared-memory tiled kernel for single-token decode, naive kernel for multi-row encode/prefill
 - **8.49% WER** on FLEURS English (647 utterances), vs. Mistral's reported 4.90% at f32
 
 The Q4 GGUF quantized path (2.5 GB) runs entirely client-side in a browser tab via WASM + WebGPU. [Try it live.](https://huggingface.co/spaces/TrevorJS/voxtral-mini-realtime)

@@ -1,6 +1,6 @@
 [package]
 name = "voxtral-mini-realtime"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Voxtral Mini 4B Realtime - Streaming ASR in Rust with Burn"
 license = "Apache-2.0"
@@ -101,6 +101,11 @@ harness = false
 
 [[bench]]
 name = "q4_ops"
+harness = false
+required-features = ["wgpu"]
+
+[[bench]]
+name = "q4_pipeline"
 harness = false
 required-features = ["wgpu"]
 

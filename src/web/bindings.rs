@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::tensor::{Int, Tensor};
 
+use crate::audio::chunk::{chunk_audio, needs_chunking, ChunkConfig};
 use crate::audio::mel::{MelConfig, MelSpectrogram};
 use crate::audio::pad::{pad_audio, PadConfig};
 use crate::audio::AudioBuffer;
@@ -232,6 +233,9 @@ impl VoxtralQ4 {
 
     /// Transcribe audio to text.
     ///
+    /// Long audio is automatically chunked to stay within WebGPU's shared
+    /// memory limits (max 1200 mel frames per chunk, matching the CLI).
+    ///
     /// # Arguments
     /// * `audio` - Audio samples as a Float32Array (must be 16kHz mono)
     ///
@@ -248,28 +252,69 @@ impl VoxtralQ4 {
             .as_ref()
             .ok_or("Tokenizer not loaded. Call loadModel first.")?;
 
-        // Create audio buffer (assumes 16kHz input) and normalize peak amplitude.
-        // Q4 quantization can't resolve subtle mel features from quiet audio, so
-        // we normalize to ensure the mel spectrogram is well above the noise floor.
+        // Normalize peak amplitude — Q4 can't resolve subtle mel features from
+        // quiet audio, so we lift to 0.95 before mel computation.
         let mut audio_buf = AudioBuffer {
             samples: audio.to_vec(),
             sample_rate: 16000,
         };
         audio_buf.peak_normalize(0.95);
 
-        // Apply padding for streaming alignment
-        let padded = pad_audio(&audio_buf, &self.pad_config);
+        // Chunk long audio to stay within WebGPU shared memory limits.
+        let chunk_config = ChunkConfig::voxtral().with_max_frames(1200);
+        let sample_chunks = if needs_chunking(audio_buf.samples.len(), &chunk_config) {
+            chunk_audio(&audio_buf.samples, &chunk_config)
+        } else {
+            vec![crate::audio::AudioChunk {
+                samples: audio_buf.samples.clone(),
+                start_sample: 0,
+                end_sample: audio_buf.samples.len(),
+                index: 0,
+                is_last: true,
+            }]
+        };
 
-        // Extract mel spectrogram
+        let t_embed = self.time_embed.embed::<Backend>(6.0, &self.device);
+        let mut texts = Vec::new();
+
+        for chunk in &sample_chunks {
+            let chunk_audio = AudioBuffer::new(chunk.samples.clone(), audio_buf.sample_rate);
+            let mel_tensor = self.audio_to_mel(&chunk_audio)?;
+
+            let audio_embeds = model.encode_audio(mel_tensor);
+            let generated_tokens = self
+                .decode_with_cache_async(model, audio_embeds, t_embed.clone())
+                .await?;
+
+            let text_tokens: Vec<u32> = generated_tokens
+                .iter()
+                .filter(|&&t| t >= 1000)
+                .map(|&t| t as u32)
+                .collect();
+
+            let text = tokenizer
+                .decode(&text_tokens)
+                .map_err(|e| format!("Failed to decode tokens: {}", e))?;
+
+            if !text.trim().is_empty() {
+                texts.push(text.trim().to_string());
+            }
+        }
+
+        Ok(texts.join(" "))
+    }
+
+    /// Convert an audio buffer to a mel spectrogram tensor.
+    fn audio_to_mel(&self, audio: &AudioBuffer) -> Result<Tensor<Backend, 3>, String> {
+        let padded = pad_audio(audio, &self.pad_config);
         let mel = self.mel_extractor.compute_log(&padded.samples);
         let n_frames = mel.len();
         let n_mels = if n_frames > 0 { mel[0].len() } else { 0 };
 
         if n_frames == 0 {
-            return Ok(String::new());
+            return Err("Audio too short to produce mel frames".to_string());
         }
 
-        // Transpose to [n_mels, n_frames] and create tensor
         let mut mel_transposed = vec![vec![0.0f32; n_frames]; n_mels];
         for (frame_idx, frame) in mel.iter().enumerate() {
             for (mel_idx, &val) in frame.iter().enumerate() {
@@ -277,32 +322,10 @@ impl VoxtralQ4 {
             }
         }
         let mel_flat: Vec<f32> = mel_transposed.into_iter().flatten().collect();
-        let mel_tensor: Tensor<Backend, 3> = Tensor::from_data(
+        Ok(Tensor::from_data(
             burn::tensor::TensorData::new(mel_flat, [1, n_mels, n_frames]),
             &self.device,
-        );
-
-        // Encode audio through Q4 encoder + adapter
-        let audio_embeds = model.encode_audio(mel_tensor);
-
-        // Create time embedding (t=6 for 480ms delay)
-        let t_embed = self.time_embed.embed::<Backend>(6.0, &self.device);
-
-        // Run async autoregressive decoding (avoids into_scalar panic in WASM)
-        let generated_tokens = self
-            .decode_with_cache_async(model, audio_embeds, t_embed)
-            .await?;
-
-        // Filter control tokens and decode
-        let text_tokens: Vec<u32> = generated_tokens
-            .iter()
-            .filter(|&&t| t >= 1000)
-            .map(|&t| t as u32)
-            .collect();
-
-        tokenizer
-            .decode(&text_tokens)
-            .map_err(|e| format!("Failed to decode tokens: {}", e))
+        ))
     }
 
     /// Get the expected sample rate for input audio.

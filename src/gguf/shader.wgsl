@@ -1,10 +1,8 @@
-// Q4_0 Dequantization + Matrix Multiplication Compute Shader
+// Q4_0 Dequantization + Matrix Multiplication Compute Shader (tiled variant)
 //
 // Performs a fused dequant-matmul for Q4_0 quantized weight tensors on GPU.
 // Computes: output[B, M, N] = input[B, M, K] × weights[N, K]^T
 // where weights are stored in GGML Q4_0 block format.
-//
-// == Optimization strategy ==
 //
 // Uses workgroup shared memory to tile the K (inner) dimension:
 //   1. Threads cooperatively load a TILE_K-sized slice of the input row
@@ -14,42 +12,18 @@
 //
 // For M=1 (decode), this eliminates redundant global reads: the input vector
 // is loaded once into shared memory and reused by all threads in the workgroup.
-//
-// == Q4_0 Block Format (GGML standard, interleaved) ==
-//
-// Each block encodes 32 weights into 18 bytes:
-//   Bytes 0-1:  f16 scale `d`
-//   Bytes 2-17: 16 bytes of packed 4-bit quantized values
-//   Lower nibble (bits 0-3) → elements 0-15
-//   Upper nibble (bits 4-7) → elements 16-31
-//   Dequantized value = (nibble - 8) * d
 
-// -- Dimensions (templated as compile-time constants) --
-// Using constants instead of a storage buffer satisfies Chrome's WGSL
-// uniform control flow requirement for workgroupBarrier().
-const B: u32 = {{ dim_b }}u;
-const M: u32 = {{ dim_m }}u;
-const K: u32 = {{ dim_k }}u;
-const N: u32 = {{ dim_n }}u;
-const blocks_per_row: u32 = {{ blocks_per_row }}u;
-
-// -- Bindings (no info buffer needed — dimensions are constants) --
 @group(0) @binding(0) var<storage, read_write> weights: array<u32>;
 @group(0) @binding(1) var<storage, read_write> input: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<storage, read_write> info: array<u32>;
 
 // Tile size for K-dimension shared memory. Must be a multiple of 32 (Q4 block size).
-// 512 = 16 Q4 blocks per tile. Halves barrier syncs vs 256.
-// All model K values (1280, 3072, 5120, 9216) are multiples of 32.
 const TILE_K: u32 = 512u;
 
 // Shared memory for the input vector tile.
 var<workgroup> shared_input: array<f32, 512>;  // TILE_K elements
 
-// ---------------------------------------------------------------------------
-// read_u32_unaligned: Read a u32 from the weights buffer at an arbitrary byte
-// offset, handling misalignment by combining two adjacent u32 words.
-// ---------------------------------------------------------------------------
 fn read_u32_unaligned(byte_offset: u32) -> u32 {
     let word = byte_offset >> 2u;
     let shift = (byte_offset & 3u) << 3u;
@@ -59,34 +33,28 @@ fn read_u32_unaligned(byte_offset: u32) -> u32 {
     return (weights[word] >> shift) | (weights[word + 1u] << (32u - shift));
 }
 
-// ---------------------------------------------------------------------------
-// read_f16_scale: Read the f16 scale factor at the start of a Q4_0 block.
-// ---------------------------------------------------------------------------
 fn read_f16_scale(block_byte_offset: u32) -> f32 {
     let bits = read_u32_unaligned(block_byte_offset) & 0xFFFFu;
     return unpack2x16float(bits).x;
 }
 
-// ---------------------------------------------------------------------------
-// Main kernel entry point.
-//
-// Thread mapping:
-//   gid.x → n  (output column, one thread per output element in N)
-//   gid.y → bm (flattened b * M + m, one workgroup row per output row)
-// ---------------------------------------------------------------------------
 @compute @workgroup_size({{ workgroup_size_x }}, 1, 1)
 fn main(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
+    let B = info[0];
+    let M = info[1];
+    let K = info[2];
+    let N = info[3];
+    let blocks_per_row = info[4];
+
     let n = gid.x;
     let bm = gid.y;
     let m = bm % M;
     let b = bm / M;
 
-    // No early return — all threads must reach workgroupBarrier() to satisfy
-    // Chrome's WGSL uniform control flow requirement. Out-of-bounds threads
-    // participate in barriers but skip computation and output writes.
+    // No early return — all threads must reach workgroupBarrier().
     let valid = b < B;
 
     var acc: f32 = 0.0;
@@ -118,9 +86,6 @@ fn main(
                 let scale = read_f16_scale(block_byte);
                 let k_base = blk * 32u;
 
-                // Read 16 data bytes as 4 u32 words, process with vec4 dot products.
-                // Each u32 holds 4 packed bytes; each byte has lo nibble (elem 0-15)
-                // and hi nibble (elem 16-31).
                 let data_start = block_byte + 2u;
                 for (var wi: u32 = 0u; wi < 4u; wi = wi + 1u) {
                     let packed = read_u32_unaligned(data_start + wi * 4u);
