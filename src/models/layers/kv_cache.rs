@@ -65,20 +65,15 @@ impl<B: Backend> KVCache<B> {
     }
 
     /// Update the cache with new key tensor.
+    ///
+    /// In pre-allocated mode, use `update()` instead — it advances `self.len`
+    /// atomically for both K and V.
     pub fn update_k(&mut self, k: Tensor<B, 4>) -> Tensor<B, 4> {
-        if self.capacity > 0 {
-            let new_seq = k.dims()[2];
-            let pos = self.len;
-            let buf = self.k.take().unwrap();
-            let [b, h, _, hd] = buf.dims();
-            let buf = buf.slice_assign([0..b, 0..h, pos..pos + new_seq, 0..hd], k);
-            // len is advanced here; if using update(), it gets advanced twice
-            // (once for k, once for v) — but update() handles len itself.
-            let new_len = pos + new_seq;
-            let view = buf.clone().slice([0..b, 0..h, 0..new_len, 0..hd]);
-            self.k = Some(buf);
-            view
-        } else {
+        assert_eq!(
+            self.capacity, 0,
+            "update_k not supported in pre-allocated mode; use update() instead"
+        );
+        {
             match &self.k {
                 None => {
                     self.k = Some(k.clone());
@@ -94,18 +89,15 @@ impl<B: Backend> KVCache<B> {
     }
 
     /// Update the cache with new value tensor.
+    ///
+    /// In pre-allocated mode, use `update()` instead — it advances `self.len`
+    /// atomically for both K and V.
     pub fn update_v(&mut self, v: Tensor<B, 4>) -> Tensor<B, 4> {
-        if self.capacity > 0 {
-            let new_seq = v.dims()[2];
-            let pos = self.len;
-            let buf = self.v.take().unwrap();
-            let [b, h, _, hd] = buf.dims();
-            let buf = buf.slice_assign([0..b, 0..h, pos..pos + new_seq, 0..hd], v);
-            let new_len = pos + new_seq;
-            let view = buf.clone().slice([0..b, 0..h, 0..new_len, 0..hd]);
-            self.v = Some(buf);
-            view
-        } else {
+        assert_eq!(
+            self.capacity, 0,
+            "update_v not supported in pre-allocated mode; use update() instead"
+        );
+        {
             match &self.v {
                 None => {
                     self.v = Some(v.clone());
@@ -312,6 +304,52 @@ mod tests {
         // Apply sliding window of 5
         cache.apply_sliding_window(5);
         assert_eq!(cache.seq_len(), 5);
+    }
+
+    #[test]
+    fn test_kv_cache_preallocated() {
+        let device = Default::default();
+        let mut cache: KVCache<TestBackend> = KVCache::preallocated(1, 4, 32, 16, &device);
+
+        assert_eq!(cache.seq_len(), 0);
+
+        // First update: prefill 5 tokens
+        let k1 = Tensor::<TestBackend, 4>::ones([1, 4, 5, 16], &device);
+        let v1 = Tensor::<TestBackend, 4>::ones([1, 4, 5, 16], &device);
+        let (k_out, v_out) = cache.update(k1, v1);
+        assert_eq!(k_out.dims(), [1, 4, 5, 16]);
+        assert_eq!(v_out.dims(), [1, 4, 5, 16]);
+        assert_eq!(cache.seq_len(), 5);
+
+        // Second update: single decode step
+        let k2 = Tensor::<TestBackend, 4>::ones([1, 4, 1, 16], &device);
+        let v2 = Tensor::<TestBackend, 4>::ones([1, 4, 1, 16], &device);
+        let (k_out, v_out) = cache.update(k2, v2);
+        assert_eq!(k_out.dims(), [1, 4, 6, 16]);
+        assert_eq!(v_out.dims(), [1, 4, 6, 16]);
+        assert_eq!(cache.seq_len(), 6);
+
+        // Reset should zero the position
+        cache.reset();
+        assert_eq!(cache.seq_len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "update_k not supported in pre-allocated mode")]
+    fn test_kv_cache_preallocated_rejects_update_k() {
+        let device = Default::default();
+        let mut cache: KVCache<TestBackend> = KVCache::preallocated(1, 4, 32, 16, &device);
+        let k = Tensor::<TestBackend, 4>::zeros([1, 4, 1, 16], &device);
+        cache.update_k(k);
+    }
+
+    #[test]
+    #[should_panic(expected = "update_v not supported in pre-allocated mode")]
+    fn test_kv_cache_preallocated_rejects_update_v() {
+        let device = Default::default();
+        let mut cache: KVCache<TestBackend> = KVCache::preallocated(1, 4, 32, 16, &device);
+        let v = Tensor::<TestBackend, 4>::zeros([1, 4, 1, 16], &device);
+        cache.update_v(v);
     }
 
     #[test]

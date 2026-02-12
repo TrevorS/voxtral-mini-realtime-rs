@@ -27,7 +27,13 @@ pub fn init() -> Option<ProfilingGuard> {
             .build();
 
         use tracing_subscriber::prelude::*;
-        tracing_subscriber::registry().with(chrome_layer).init();
+        if tracing_subscriber::registry()
+            .with(chrome_layer)
+            .try_init()
+            .is_err()
+        {
+            return None;
+        }
 
         Some(ProfilingGuard { _guard: guard })
     }

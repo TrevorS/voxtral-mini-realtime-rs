@@ -941,8 +941,8 @@ impl Q4VoxtralModel {
             // would trigger (it calls into_data() to read the token ID back).
             let text_embed = self.decoder.embed_tokens_from_ids(&[new_token], 1, 1);
 
-            // Use pre-sliced audio position (pos-1 maps to index pos-1-PREFIX_LEN
-            // in audio_slices, but we need the pos-1 position which is at index pos-1-PREFIX_LEN)
+            // Use the pre-sliced audio for position pos-1: positions PREFIX_LEN..seq_len
+            // map to audio_slices indices 0.., so pos-1 maps to index pos-1-PREFIX_LEN.
             let audio_pos = audio_slices[pos - 1 - PREFIX_LEN].clone();
 
             let input = audio_pos + text_embed;
