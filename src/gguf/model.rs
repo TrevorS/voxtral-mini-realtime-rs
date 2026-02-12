@@ -704,6 +704,23 @@ impl Q4LanguageModel {
     pub fn create_cache(&self) -> LayerCaches<Wgpu> {
         LayerCaches::new(self.layers.len())
     }
+
+    /// Create a pre-allocated KV cache sized for the given max sequence length.
+    ///
+    /// Avoids per-step GPU allocations by writing into fixed buffers.
+    pub fn create_cache_preallocated(&self, max_seq: usize) -> LayerCaches<Wgpu> {
+        // Decoder uses GQA: 8 KV heads, head_dim = d_model / n_heads = 3072 / 32 = 96
+        let n_kv_heads = self.layers.first().map_or(8, |l| l.attention.n_kv_heads);
+        let head_dim = self.layers.first().map_or(96, |l| l.attention.head_dim);
+        LayerCaches::new_preallocated(
+            self.layers.len(),
+            1, // batch = 1 for streaming
+            n_kv_heads,
+            max_seq,
+            head_dim,
+            &self.device,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -764,6 +781,7 @@ impl Q4VoxtralModel {
 
     /// Encode audio to hidden states ready for the LLM.
     pub fn encode_audio(&self, mel: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
+        let _span = tracing::info_span!("encode_audio").entered();
         let encoder_out = self.encoder.forward(mel, 0);
         let reshaped = reshape_encoder_output(encoder_out, self.reshape_factor);
         self.adapter.forward(reshaped)
@@ -857,38 +875,44 @@ impl Q4VoxtralModel {
         mel: Tensor<Wgpu, 3>,
         t_embed_decoder: Tensor<Wgpu, 3>,
     ) -> Vec<i32> {
-        let device = mel.device();
+        let _span = tracing::info_span!("transcribe_streaming").entered();
 
         let audio_embeds = self.encode_audio(mel);
-        let seq_len = audio_embeds.dims()[1];
+        let [_, seq_len, d_model] = audio_embeds.dims();
 
         const PREFIX_LEN: usize = 38;
         const BOS_TOKEN: i32 = 1;
         const STREAMING_PAD: i32 = 32;
 
+        if seq_len < PREFIX_LEN {
+            return Vec::new();
+        }
+
         let mut prefix: Vec<i32> = vec![BOS_TOKEN];
         prefix.extend(std::iter::repeat_n(STREAMING_PAD, PREFIX_LEN - 1));
 
-        let prefix_tensor = Tensor::<Wgpu, 2, Int>::from_data(
-            burn::tensor::TensorData::new(prefix.clone(), [1, PREFIX_LEN]),
-            &device,
-        );
-        let prefix_text_embeds = self.decoder.embed_tokens(prefix_tensor);
+        // Use embed_tokens_from_ids for the prefix to skip unnecessary
+        // GPU round-trip (the prefix tokens are known CPU-side).
+        let prefix_text_embeds = self.decoder.embed_tokens_from_ids(&prefix, 1, PREFIX_LEN);
 
-        let prefix_audio =
-            audio_embeds
-                .clone()
-                .slice([0..1, 0..PREFIX_LEN, 0..audio_embeds.dims()[2]]);
+        let prefix_audio = audio_embeds
+            .clone()
+            .slice([0..1, 0..PREFIX_LEN, 0..d_model]);
 
         let prefix_inputs = prefix_audio + prefix_text_embeds;
 
-        let mut decoder_cache = self.create_decoder_cache();
+        // Pre-allocate KV cache to the known sequence length to avoid
+        // 52 growing Tensor::cat allocations per decode step (26 layers × K + V).
+        let mut decoder_cache = self.decoder.create_cache_preallocated(seq_len);
 
-        let hidden = self.decoder.forward_hidden_with_cache(
-            prefix_inputs,
-            t_embed_decoder.clone(),
-            &mut decoder_cache,
-        );
+        let hidden = {
+            let _prefill = tracing::info_span!("prefill").entered();
+            self.decoder.forward_hidden_with_cache(
+                prefix_inputs,
+                t_embed_decoder.clone(),
+                &mut decoder_cache,
+            )
+        };
         let logits = self.decoder.lm_head(hidden);
 
         let last_logits =
@@ -901,18 +925,25 @@ impl Q4VoxtralModel {
         let mut generated = prefix;
         generated.push(first_token);
 
+        // Pre-slice all audio positions to avoid cloning the full audio_embeds
+        // tensor every decode step.
+        let audio_slices: Vec<Tensor<Wgpu, 3>> = (PREFIX_LEN..seq_len)
+            .map(|pos| audio_embeds.clone().slice([0..1, pos..pos + 1, 0..d_model]))
+            .collect();
+        // audio_embeds no longer needed — drop to free GPU memory
+        drop(audio_embeds);
+
+        let _decode_span =
+            tracing::info_span!("decode", tokens = seq_len - PREFIX_LEN - 1).entered();
         for pos in (PREFIX_LEN + 1)..seq_len {
             let new_token = generated[pos - 1];
-            let token_tensor = Tensor::<Wgpu, 2, Int>::from_data(
-                burn::tensor::TensorData::new(vec![new_token], [1, 1]),
-                &device,
-            );
-            let text_embed = self.decoder.embed_tokens(token_tensor);
+            // Use embed_tokens_from_ids to avoid GPU→CPU sync that embed_tokens
+            // would trigger (it calls into_data() to read the token ID back).
+            let text_embed = self.decoder.embed_tokens_from_ids(&[new_token], 1, 1);
 
-            let audio_pos =
-                audio_embeds
-                    .clone()
-                    .slice([0..1, (pos - 1)..pos, 0..audio_embeds.dims()[2]]);
+            // Use the pre-sliced audio for position pos-1: positions PREFIX_LEN..seq_len
+            // map to audio_slices indices 0.., so pos-1 maps to index pos-1-PREFIX_LEN.
+            let audio_pos = audio_slices[pos - 1 - PREFIX_LEN].clone();
 
             let input = audio_pos + text_embed;
 
@@ -949,5 +980,10 @@ impl Q4VoxtralModel {
     /// Create KV caches for the decoder.
     pub fn create_decoder_cache(&self) -> LayerCaches<Wgpu> {
         self.decoder.create_cache()
+    }
+
+    /// Create pre-allocated KV caches for the decoder.
+    pub fn create_decoder_cache_preallocated(&self, max_seq: usize) -> LayerCaches<Wgpu> {
+        self.decoder.create_cache_preallocated(max_seq)
     }
 }

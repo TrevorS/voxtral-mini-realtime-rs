@@ -52,6 +52,21 @@ impl AudioBuffer {
         self.duration_secs() * 1000.0
     }
 
+    /// Normalize audio to target peak amplitude.
+    ///
+    /// Scales all samples so the maximum absolute value equals `target_peak`.
+    /// Returns self unchanged if audio is silent (max amplitude < 1e-10).
+    pub fn peak_normalize(&mut self, target_peak: f32) {
+        let max_amp = self.samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        if max_amp < 1e-10 {
+            return;
+        }
+        let scale = target_peak / max_amp;
+        for s in &mut self.samples {
+            *s *= scale;
+        }
+    }
+
     /// Append samples from another buffer (must have same sample rate).
     pub fn append(&mut self, other: &AudioBuffer) -> Result<()> {
         if self.sample_rate != other.sample_rate {
@@ -181,6 +196,37 @@ mod tests {
         let mut buffer1 = AudioBuffer::new(vec![0.5f32; 100], 16000);
         let buffer2 = AudioBuffer::new(vec![0.3f32; 50], 24000);
         assert!(buffer1.append(&buffer2).is_err());
+    }
+
+    #[test]
+    fn test_peak_normalize_quiet_audio() {
+        let mut buf = AudioBuffer::new(vec![0.001, -0.002, 0.0015, -0.001], 16000);
+        buf.peak_normalize(0.95);
+        let max_amp = buf.samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert!(
+            (max_amp - 0.95).abs() < 1e-6,
+            "Peak should be 0.95, got {max_amp}"
+        );
+        // Check relative amplitudes preserved
+        assert!(buf.samples[1].abs() > buf.samples[0].abs());
+    }
+
+    #[test]
+    fn test_peak_normalize_normal_audio() {
+        let mut buf = AudioBuffer::new(vec![0.5, -0.9, 0.3], 16000);
+        buf.peak_normalize(0.95);
+        let max_amp = buf.samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert!(
+            (max_amp - 0.95).abs() < 1e-6,
+            "Peak should be 0.95, got {max_amp}"
+        );
+    }
+
+    #[test]
+    fn test_peak_normalize_silent_audio() {
+        let mut buf = AudioBuffer::new(vec![0.0, 0.0, 0.0], 16000);
+        buf.peak_normalize(0.95);
+        assert!(buf.samples.iter().all(|&s| s == 0.0));
     }
 
     #[test]

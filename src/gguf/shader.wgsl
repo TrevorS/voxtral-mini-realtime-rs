@@ -1,141 +1,133 @@
-// Q4_0 Dequantization + Matrix Multiplication Compute Shader
+// Q4_0 Dequantization + Matrix Multiplication Compute Shader (tiled variant)
 //
 // Performs a fused dequant-matmul for Q4_0 quantized weight tensors on GPU.
 // Computes: output[B, M, N] = input[B, M, K] × weights[N, K]^T
 // where weights are stored in GGML Q4_0 block format.
 //
-// == Q4_0 Block Format (GGML standard, interleaved) ==
+// Uses workgroup shared memory to tile the K (inner) dimension:
+//   1. Threads cooperatively load a TILE_K-sized slice of the input row
+//   2. Each thread accumulates against its own weight row using shared input
+//   3. Weight reads use vectorized u32 loads (4 bytes at once vs byte-by-byte)
+//   4. Accumulation uses vec4 dot products for SIMD efficiency
 //
-// Each block encodes 32 weights into 18 bytes:
-//
-//   Bytes 0-1:  f16 scale `d` — rescales the quantized ints
-//   Bytes 2-17: 16 bytes of packed 4-bit quantized values
-//
-// Nibble packing within the 16 data bytes:
-//   - Each byte holds two 4-bit values (nibbles)
-//   - Lower nibble (bits 0-3) → elements 0-15
-//   - Upper nibble (bits 4-7) → elements 16-31
-//   - Each nibble stores (value + 8) & 0xF, so dequantized value = (nibble - 8) * d
-//
-// The weight tensor [N, K] (out_features, in_features) is flattened row-major
-// and divided into consecutive blocks of 32 elements. Weight at position (n, k)
-// has flat index (n * K + k), which falls in block (flat_index / 32) at element
-// (flat_index % 32). This matches PyTorch/GGUF convention where each row is one
-// output neuron's weights, giving contiguous memory access per output thread.
-//
-// == Memory Layout ==
-//
-// The raw Q4_0 bytes are uploaded as-is and bound as array<u32>. Since blocks
-// are 18 bytes (not a multiple of 4), we use byte-level addressing within the
-// u32 array. Block `b` starts at byte offset `b * 18`.
+// For M=1 (decode), this eliminates redundant global reads: the input vector
+// is loaded once into shared memory and reused by all threads in the workgroup.
 
-// -- Bindings --
-// All bindings use read_write to avoid wgpu validation errors when cubecl's
-// memory sub-allocator places multiple bindings in the same underlying buffer.
-// This matches burn-cubecl's internal approach of marking all bindings ReadWrite.
-//
-// weights: raw Q4_0 bytes viewed as u32 array. Byte `i` is in weights[i/4],
-// shifted by (i%4)*8 bits.
 @group(0) @binding(0) var<storage, read_write> weights: array<u32>;
-// input: f32 activation tensor, shape [B, M, K], row-major
 @group(0) @binding(1) var<storage, read_write> input: array<f32>;
-// output: f32 result tensor, shape [B, M, N], row-major
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
-// info: dimension metadata [B, M, K, N, num_blocks_per_row]
 @group(0) @binding(3) var<storage, read_write> info: array<u32>;
 
-// ---------------------------------------------------------------------------
-// read_byte: Read a single byte from the weights buffer at the given byte offset.
-// ---------------------------------------------------------------------------
-fn read_byte(byte_offset: u32) -> u32 {
-    let word_idx = byte_offset / 4u;
-    let byte_pos = byte_offset % 4u;
-    return (weights[word_idx] >> (byte_pos * 8u)) & 0xFFu;
+// Tile size for K-dimension shared memory. Must be a multiple of 32 (Q4 block size).
+const TILE_K: u32 = 512u;
+
+// Shared memory for the input vector tile.
+var<workgroup> shared_input: array<f32, 512>;  // TILE_K elements
+
+fn read_u32_unaligned(byte_offset: u32) -> u32 {
+    let word = byte_offset >> 2u;
+    let shift = (byte_offset & 3u) << 3u;
+    if (shift == 0u) {
+        return weights[word];
+    }
+    return (weights[word] >> shift) | (weights[word + 1u] << (32u - shift));
 }
 
-// ---------------------------------------------------------------------------
-// read_f16_scale: Read the f16 scale factor at the start of a Q4_0 block.
-// Returns the scale as f32.
-// ---------------------------------------------------------------------------
 fn read_f16_scale(block_byte_offset: u32) -> f32 {
-    // f16 occupies 2 bytes in little-endian order
-    let lo = read_byte(block_byte_offset);
-    let hi = read_byte(block_byte_offset + 1u);
-    let bits = lo | (hi << 8u);
+    let bits = read_u32_unaligned(block_byte_offset) & 0xFFFFu;
     return unpack2x16float(bits).x;
 }
 
-// ---------------------------------------------------------------------------
-// dequant: Reconstruct a single f32 weight from Q4_0 packed representation.
-//
-// `global_flat_idx` is the position of the weight in the flattened [N, K] tensor.
-// ---------------------------------------------------------------------------
-fn dequant(global_flat_idx: u32) -> f32 {
-    let block_idx = global_flat_idx / 32u;
-    let elem_idx  = global_flat_idx % 32u;
-
-    // Each block is 18 bytes: 2 bytes scale + 16 bytes nibbles
-    let block_start = block_idx * 18u;
-
-    // Read the f16 scale factor
-    let d = read_f16_scale(block_start);
-
-    // Map element index to the byte containing its nibble.
-    // Elements 0-15 use the lower nibble, elements 16-31 use the upper nibble
-    // of the same byte position.
-    let local = elem_idx % 16u;
-
-    // Nibble data starts at byte offset 2 within the block
-    let data_byte = read_byte(block_start + 2u + local);
-
-    // Lower nibble (bits 0-3) for elements 0-15,
-    // upper nibble (bits 4-7) for elements 16-31
-    let nibble = select(data_byte & 0xFu, (data_byte >> 4u) & 0xFu, elem_idx >= 16u);
-
-    // Dequantize: nibbles store (value + 8), so subtract 8 and scale.
-    return (f32(nibble) - 8.0) * d;
-}
-
-// ---------------------------------------------------------------------------
-// Main kernel entry point.
-//
-// Thread mapping (naive: one thread per output element):
-//   gid.x  → n  (column in output / weight matrix)
-//   gid.y  → flattened (b * M + m), i.e. batch and row combined
-//
-// Each thread accumulates the dot product over the K dimension:
-//   output[b, m, n] = Σ_k  input[b, m, k] * dequant(weights[n, k])
-// ---------------------------------------------------------------------------
-@compute @workgroup_size({{ workgroup_size_x }}, {{ workgroup_size_y }}, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+@compute @workgroup_size({{ workgroup_size_x }}, 1, 1)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
     let B = info[0];
     let M = info[1];
     let K = info[2];
     let N = info[3];
-    // info[4] = num_blocks_per_row (reserved for future tiled kernels)
+    let blocks_per_row = info[4];
 
     let n = gid.x;
-    let bm = gid.y;   // flattened batch * M + row
+    let bm = gid.y;
     let m = bm % M;
     let b = bm / M;
 
-    // Early exit for out-of-bounds threads (workgroup may overshoot dimensions).
-    if (n >= N || b >= B) {
-        return;
-    }
+    // No early return — all threads must reach workgroupBarrier().
+    let valid = b < B;
 
     var acc: f32 = 0.0;
+    let input_base = select(0u, b * M * K + m * K, valid);
+    let wg_size = {{ workgroup_size_x }}u;
+    let num_tiles = (K + TILE_K - 1u) / TILE_K;
 
-    // Base offset into the input tensor for this (b, m) slice.
-    let input_base = b * M * K + m * K;
+    for (var tile: u32 = 0u; tile < num_tiles; tile = tile + 1u) {
+        let tile_start = tile * TILE_K;
 
-    // Accumulate dot product over the K (inner) dimension.
-    for (var k: u32 = 0u; k < K; k = k + 1u) {
-        // Weight position in the flattened [N, K] tensor (row n, column k).
-        let weight_flat = n * K + k;
-        acc = acc + dequant(weight_flat) * input[input_base + k];
+        // -- Cooperative load: all threads load input tile into shared memory --
+        for (var k_local: u32 = lid.x; k_local < TILE_K; k_local = k_local + wg_size) {
+            let k_global = tile_start + k_local;
+            if (valid && k_global < K) {
+                shared_input[k_local] = input[input_base + k_global];
+            }
+        }
+        workgroupBarrier();
+
+        // -- Vectorized dequant+accumulate against shared input --
+        if (valid && n < N) {
+            let tile_end = min(tile_start + TILE_K, K);
+            let blocks_in_tile = (tile_end - tile_start) / 32u;
+            let block_base = tile_start / 32u;
+
+            for (var blk: u32 = 0u; blk < blocks_in_tile; blk = blk + 1u) {
+                let global_block = n * blocks_per_row + block_base + blk;
+                let block_byte = global_block * 18u;
+                let scale = read_f16_scale(block_byte);
+                let k_base = blk * 32u;
+
+                let data_start = block_byte + 2u;
+                for (var wi: u32 = 0u; wi < 4u; wi = wi + 1u) {
+                    let packed = read_u32_unaligned(data_start + wi * 4u);
+                    let b0 = packed & 0xFFu;
+                    let b1 = (packed >> 8u) & 0xFFu;
+                    let b2 = (packed >> 16u) & 0xFFu;
+                    let b3 = (packed >> 24u) & 0xFFu;
+
+                    let base_i = wi * 4u;
+
+                    // Lower nibbles → elements [base_i..base_i+3]
+                    let w_lo = (vec4<f32>(
+                        f32(b0 & 0xFu), f32(b1 & 0xFu),
+                        f32(b2 & 0xFu), f32(b3 & 0xFu)
+                    ) - vec4<f32>(8.0)) * scale;
+                    let in_lo = vec4<f32>(
+                        shared_input[k_base + base_i],
+                        shared_input[k_base + base_i + 1u],
+                        shared_input[k_base + base_i + 2u],
+                        shared_input[k_base + base_i + 3u]
+                    );
+                    acc += dot(w_lo, in_lo);
+
+                    // Upper nibbles → elements [16+base_i..16+base_i+3]
+                    let w_hi = (vec4<f32>(
+                        f32((b0 >> 4u) & 0xFu), f32((b1 >> 4u) & 0xFu),
+                        f32((b2 >> 4u) & 0xFu), f32((b3 >> 4u) & 0xFu)
+                    ) - vec4<f32>(8.0)) * scale;
+                    let in_hi = vec4<f32>(
+                        shared_input[k_base + 16u + base_i],
+                        shared_input[k_base + 16u + base_i + 1u],
+                        shared_input[k_base + 16u + base_i + 2u],
+                        shared_input[k_base + 16u + base_i + 3u]
+                    );
+                    acc += dot(w_hi, in_hi);
+                }
+            }
+        }
+        workgroupBarrier();
     }
 
-    // Store result at output[b, m, n].
-    output[b * M * N + m * N + n] = acc;
+    if (n < N && b < B) {
+        output[b * M * N + m * N + n] = acc;
+    }
 }

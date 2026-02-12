@@ -97,6 +97,9 @@ export class VoxtralQ4 {
     /**
      * Transcribe audio to text.
      *
+     * Long audio is automatically chunked to stay within WebGPU's shared
+     * memory limits (max 1200 mel frames per chunk, matching the CLI).
+     *
      * # Arguments
      * * `audio` - Audio samples as a Float32Array (must be 16kHz mono)
      *
@@ -506,7 +509,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return wasm_bindgen__convert__closures_____invoke__h0bf2673d9a4ed97e(a, state0.b, arg0, arg1);
+                        return wasm_bindgen__convert__closures_____invoke__h62dcec66527434bd(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -805,8 +808,8 @@ function __wbg_get_imports() {
             arg0.writeBuffer(arg1, arg2, arg3, arg4, arg5);
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 2140, function: Function { arguments: [Externref], shim_idx: 2141, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__hd6e701f6b11034a8, wasm_bindgen__convert__closures_____invoke__h658b39318c0bce1e);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 2121, function: Function { arguments: [Externref], shim_idx: 2122, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__hdff905a413937006, wasm_bindgen__convert__closures_____invoke__h8898a47b26a60a5c);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0) {
@@ -840,12 +843,12 @@ function __wbg_get_imports() {
     };
 }
 
-function wasm_bindgen__convert__closures_____invoke__h658b39318c0bce1e(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h658b39318c0bce1e(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h8898a47b26a60a5c(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h8898a47b26a60a5c(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h0bf2673d9a4ed97e(arg0, arg1, arg2, arg3) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h0bf2673d9a4ed97e(arg0, arg1, arg2, arg3);
+function wasm_bindgen__convert__closures_____invoke__h62dcec66527434bd(arg0, arg1, arg2, arg3) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h62dcec66527434bd(arg0, arg1, arg2, arg3);
 }
 
 

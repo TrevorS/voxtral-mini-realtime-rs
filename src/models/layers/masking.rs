@@ -53,6 +53,11 @@ pub fn apply_causal_mask_with_offset<B: Backend>(
     kv_len: usize,
     offset: usize,
 ) -> Tensor<B, 4> {
+    // During single-token cached decode (q_len=1), the query position is `offset`
+    // and all KV positions are 0..offset+1, so j ≤ offset for all j — no masking needed.
+    if q_len == 1 {
+        return scores;
+    }
     let device = scores.device();
     let mut mask_data = vec![0.0f32; q_len * kv_len];
     for i in 0..q_len {
@@ -80,6 +85,11 @@ pub fn apply_sliding_window_mask_with_offset<B: Backend>(
     window: usize,
     offset: usize,
 ) -> Tensor<B, 4> {
+    // No masking needed when the entire KV sequence fits within the window.
+    // The farthest pair is (offset + q_len - 1, 0) with distance offset + q_len - 1.
+    if offset + q_len <= window + 1 {
+        return scores;
+    }
     let device = scores.device();
     let mut mask_data = vec![0.0f32; q_len * kv_len];
     for i in 0..q_len {

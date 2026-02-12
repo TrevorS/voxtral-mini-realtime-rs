@@ -92,6 +92,10 @@ pub struct LanguageModel<B: Backend> {
     norm: RmsNorm<B>,
     /// Model dimension (for LM head).
     d_model: usize,
+    /// Number of KV heads (for pre-allocated cache sizing).
+    n_kv_heads: usize,
+    /// Head dimension (for pre-allocated cache sizing).
+    head_dim: usize,
 }
 
 impl LanguageModelConfig {
@@ -165,6 +169,8 @@ impl LanguageModelConfig {
             layers,
             norm,
             d_model: self.d_model,
+            n_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
         }
     }
 }
@@ -191,12 +197,18 @@ impl<B: Backend> LanguageModel<B> {
             },
         };
 
+        // Voxtral decoder: 32 Q heads / 8 KV heads, head_dim = 96
+        let n_kv_heads = 8;
+        let head_dim = d_model / 32; // 3072 / 32 = 96
+
         Self {
             tok_embeddings,
             rope,
             layers,
             norm,
             d_model,
+            n_kv_heads,
+            head_dim,
         }
     }
 
@@ -350,6 +362,18 @@ impl<B: Backend> LanguageModel<B> {
         LayerCaches::new(self.layers.len())
     }
 
+    /// Create a pre-allocated cache sized for the given max sequence length.
+    pub fn create_cache_preallocated(&self, max_seq: usize, device: &B::Device) -> LayerCaches<B> {
+        LayerCaches::new_preallocated(
+            self.layers.len(),
+            1, // batch = 1
+            self.n_kv_heads,
+            max_seq,
+            self.head_dim,
+            device,
+        )
+    }
+
     /// Decompose the decoder into its parts for per-layer serialization.
     ///
     /// RoPE is excluded (recomputed from config, no learned weights).
@@ -367,12 +391,16 @@ impl<B: Backend> LanguageModel<B> {
     /// `rope` must be initialized separately from config since it has no
     /// learned parameters and is not serialized.
     pub fn from_parts(parts: DecoderParts<B>, rope: RoPE<B>) -> Self {
+        let n_kv_heads = 8;
+        let head_dim = parts.d_model / 32;
         Self {
             tok_embeddings: parts.tok_embeddings,
             rope,
             layers: parts.layers,
             norm: parts.norm,
             d_model: parts.d_model,
+            n_kv_heads,
+            head_dim,
         }
     }
 }

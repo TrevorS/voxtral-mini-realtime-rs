@@ -1,6 +1,6 @@
 [package]
 name = "voxtral-mini-realtime"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Voxtral Mini 4B Realtime - Streaming ASR in Rust with Burn"
 license = "Apache-2.0"
@@ -25,6 +25,7 @@ wasm = [
     "console_error_panic_hook",
     "getrandom/wasm_js",
 ]
+profiling = ["tracing-chrome"]
 
 [dependencies]
 # Burn ML framework - latest version with backend selection via features
@@ -51,6 +52,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+tracing-chrome = { version = "0.7", optional = true }
 num-traits = "0.2"
 num-complex = "0.4"
 byteorder = "1.5"
@@ -88,6 +90,25 @@ name = "voxtral-transcribe"
 path = "src/bin/transcribe.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "e2e-bench"
+path = "src/bin/e2e_bench.rs"
+required-features = ["wgpu", "cli"]
+
+[[bench]]
+name = "audio"
+harness = false
+
+[[bench]]
+name = "q4_ops"
+harness = false
+required-features = ["wgpu"]
+
+[[bench]]
+name = "q4_pipeline"
+harness = false
+required-features = ["wgpu"]
+
 # WASM library target
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -101,6 +122,10 @@ opt-level = 3
 inherits = "release"
 # Optimize for size in WASM
 opt-level = "s"
+
+[profile.profiling]
+inherits = "release"
+debug = 1
 
 # Patch cubecl-wgpu to cap subgroup size workaround against WebGPU's
 # max_compute_invocations_per_workgroup (256). Without this, cubek-reduce
