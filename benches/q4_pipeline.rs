@@ -140,7 +140,9 @@ fn bench_model_load(c: &mut Criterion) {
         b.iter(|| {
             let path = PathBuf::from(GGUF_PATH);
             let mut loader = Q4ModelLoader::from_file(&path).expect("Failed to open GGUF");
-            let model = loader.load(&device).expect("Failed to load Q4 model");
+            let model = loader
+                .load::<Wgpu>(&device)
+                .expect("Failed to load Q4 model");
             let _ = model.encoder();
             model
         });

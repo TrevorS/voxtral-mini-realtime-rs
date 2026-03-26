@@ -16,15 +16,18 @@
 //! group layout issue: switching between tiled and naive shaders within the
 //! same session produces incorrect results.
 
-use burn::backend::wgpu::{
-    into_contiguous, AutoCompiler, CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate,
-    WgpuRuntime,
-};
-use burn::backend::Wgpu;
 use burn::tensor::{DType, Tensor, TensorPrimitive};
+use burn_cubecl::{
+    kernel::into_contiguous,
+    template::{KernelSource, SourceKernel, SourceTemplate},
+    tensor::CubeTensor,
+};
 use cubecl::prelude::KernelId;
 use cubecl::server::{Bindings, CubeCount};
-use cubecl::CubeTask;
+use cubecl::CubeDim;
+use cubecl::{CubeTask, Runtime};
+
+use crate::gguf::model::Q4Backend;
 
 use super::tensor::Q4Tensor;
 
@@ -83,9 +86,9 @@ impl KernelSource for Q4MatmulNaiveKernel {
 /// (out_features, in_features), matching PyTorch/GGUF convention.
 /// Dequantization happens inside the compute shader — no intermediate
 /// full-precision weight buffer is created.
-pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
+pub fn q4_matmul<B: Q4Backend>(input: Tensor<B, 3>, weights: &Q4Tensor<B>) -> Tensor<B, 3> {
     // Convert Tensor → CubeTensor and ensure contiguous layout
-    let cube_input: CubeTensor<WgpuRuntime> = input.into_primitive().tensor();
+    let cube_input: CubeTensor<B::Runtime> = input.into_primitive().tensor();
     let cube_input = into_contiguous(cube_input);
 
     // Extract dimensions
@@ -141,8 +144,8 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
 /// On native: tiled for M ≤ 4 (decoder), naive for M > 4 (encoder/prefill).
 /// On WASM: always naive to avoid CubeCL bind group layout issues.
 #[cfg(not(target_family = "wasm"))]
-fn dispatch(
-    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+fn dispatch<R: Runtime>(
+    client: &cubecl::client::ComputeClient<R>,
     b: usize,
     m: usize,
     n: usize,
@@ -159,7 +162,7 @@ fn dispatch(
         let wg_y = (b * m) as u32;
         client
             .launch(
-                Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                Box::new(kernel) as Box<dyn CubeTask<R::Compiler>>,
                 CubeCount::new_2d(wg_x, wg_y),
                 bindings,
             )
@@ -170,8 +173,8 @@ fn dispatch(
 }
 
 #[cfg(target_family = "wasm")]
-fn dispatch(
-    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+fn dispatch<R: Runtime>(
+    client: &cubecl::client::ComputeClient<R>,
     b: usize,
     m: usize,
     n: usize,
@@ -180,8 +183,8 @@ fn dispatch(
     dispatch_naive(client, b, m, n, bindings);
 }
 
-fn dispatch_naive(
-    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+fn dispatch_naive<R: Runtime>(
+    client: &cubecl::client::ComputeClient<R>,
     b: usize,
     m: usize,
     n: usize,
@@ -198,7 +201,7 @@ fn dispatch_naive(
     let wg_y = (b * m).div_ceil(NAIVE_WG_Y as usize) as u32;
     client
         .launch(
-            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            Box::new(kernel) as Box<dyn CubeTask<R::Compiler>>,
             CubeCount::new_2d(wg_x, wg_y),
             bindings,
         )

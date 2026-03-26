@@ -134,7 +134,7 @@ enum ModelState {
         model: voxtral_mini_realtime::models::voxtral::VoxtralModel<Backend>,
     },
     Q4 {
-        model: voxtral_mini_realtime::gguf::model::Q4VoxtralModel,
+        model: voxtral_mini_realtime::gguf::model::Q4VoxtralModel<Backend>,
     },
 }
 

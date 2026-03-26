@@ -8,6 +8,7 @@ mod tests {
     use crate::gguf::*;
     use burn::backend::Wgpu;
     use burn::tensor::{Tensor, TensorData};
+    use cubecl::wgpu::WgpuDevice;
 
     type TestBackend = Wgpu;
 
@@ -330,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_q4_dequantize_gpu() {
-        let device = Default::default();
+        let device = WgpuDevice::default();
 
         let rows = 16;
         let cols = 16;
@@ -342,7 +343,7 @@ mod tests {
         let q4_bytes = quantize_f32_to_q4_0(&original);
         let expected = dequantize_q4_0_to_f32(&q4_bytes, n_elements);
 
-        let q4_tensor = Q4Tensor::from_q4_bytes(&q4_bytes, [rows, cols], &device)
+        let q4_tensor = Q4Tensor::<Wgpu>::from_q4_bytes(&q4_bytes, [rows, cols], &device)
             .expect("Failed to create Q4Tensor");
         let dequantized = q4_tensor.dequantize();
 
@@ -574,7 +575,7 @@ mod tests {
         let ffn_dim = 128;
 
         // w1: [ffn_dim, d_model], w2: [d_model, ffn_dim], w3: [ffn_dim, d_model]
-        let make_q4 = |rows: usize, cols: usize| -> Q4Linear {
+        let make_q4 = |rows: usize, cols: usize| -> Q4Linear<Wgpu> {
             let data: Vec<f32> = (0..rows * cols)
                 .map(|i| ((i as f32) * 0.001).sin() * 0.05)
                 .collect();
@@ -611,7 +612,7 @@ mod tests {
         let test_in = 160;
         let test_out = 96;
 
-        let make_q4 = |rows: usize, cols: usize| -> Q4Linear {
+        let make_q4 = |rows: usize, cols: usize| -> Q4Linear<Wgpu> {
             let data: Vec<f32> = (0..rows * cols)
                 .map(|i| ((i as f32) * 0.001).cos() * 0.05)
                 .collect();

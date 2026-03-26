@@ -80,6 +80,7 @@ console_error_panic_hook = { version = "0.1", optional = true }
 getrandom = { version = "0.3", default-features = false, optional = true }
 # Direct wgpu dep for custom device init (must match cubecl-wgpu's version)
 wgpu = { version = "26", features = ["fragile-send-sync-non-atomic-wasm"], optional = true }
+burn-cubecl = "0.20.1"
 
 [dev-dependencies]
 criterion = "0.8"

@@ -43,7 +43,7 @@ fn make_q4_weights(
     n: usize,
     k: usize,
     device: &<Wgpu as burn::tensor::backend::Backend>::Device,
-) -> Q4Tensor {
+) -> Q4Tensor<Wgpu> {
     let weight_data: Vec<f32> = (0..n * k)
         .map(|i| ((i as f32) * 0.0007).cos() * 0.05)
         .collect();
