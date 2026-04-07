@@ -22,6 +22,8 @@ pub enum GgmlDtype {
     F16,
     /// 4-bit quantization, block size 32 (18 bytes per block).
     Q4_0,
+    /// 8-bit quantization, block size 32 (34 bytes per block).
+    Q8_0,
 }
 
 impl GgmlDtype {
@@ -30,6 +32,7 @@ impl GgmlDtype {
             0 => Ok(Self::F32),
             1 => Ok(Self::F16),
             2 => Ok(Self::Q4_0),
+            8 => Ok(Self::Q8_0),
             other => bail!("Unsupported GGML dtype code: {other}"),
         }
     }
@@ -44,7 +47,17 @@ impl GgmlDtype {
                 let num_blocks = num_elements / 32;
                 num_blocks * 18
             }
+            Self::Q8_0 => {
+                // 34 bytes per block of 32 elements: 2 (f16 scale) + 32 (int8 values)
+                let num_blocks = num_elements / 32;
+                num_blocks * 34
+            }
         }
+    }
+
+    /// Returns true if this is a block-quantized type (Q4_0 or Q8_0).
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, Self::Q4_0 | Self::Q8_0)
     }
 }
 

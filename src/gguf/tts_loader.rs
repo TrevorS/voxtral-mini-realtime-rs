@@ -25,15 +25,15 @@ use crate::tts::codec::CodecDecoder;
 use crate::tts::config::{CodecDecoderConfig, FmTransformerConfig, TtsBackboneConfig};
 
 use super::loader::{
-    dequantize_q4_0_cpu, gguf_load_f32_tensor, gguf_load_q4_linear, gguf_load_rms_norm,
-    reverse_gguf_dims,
+    dequantize_q4_0_cpu, dequantize_q8_0_cpu, gguf_load_f32_tensor, gguf_load_q4_linear,
+    gguf_load_rms_norm, reverse_gguf_dims,
 };
 use super::model::{Q4Attention, Q4FeedForward, TokEmbedStore};
 use super::reader::{GgmlDtype, GgufReader, ShardedCursor};
 use super::tensor::Q4Tensor;
 use super::tts_model::{Q4FmLayer, Q4FmTransformer, Q4TtsBackbone, Q4TtsDecoderLayer};
 
-/// All Q4 TTS model components with token embeddings still in raw Q4 form.
+/// All Q4 TTS model components with token embeddings still in raw quantized form.
 ///
 /// Used by [`Q4TtsModelLoader::load_deferred`] to allow freeing the GGUF
 /// reader's memory before dequantizing the 131K-vocab embedding table.
@@ -46,6 +46,7 @@ pub struct Q4TtsModelParts {
     pub codec: CodecDecoder<Wgpu>,
     pub tok_embed_q4_bytes: Vec<u8>,
     pub tok_embed_shape: [usize; 2],
+    pub tok_embed_dtype: GgmlDtype,
     pub config: TtsBackboneConfig,
     pub device: WgpuDevice,
 }
@@ -58,12 +59,18 @@ impl Q4TtsModelParts {
     pub fn finalize(self) -> Result<(Q4TtsBackbone, Q4FmTransformer, CodecDecoder<Wgpu>)> {
         let [vocab, d_model] = self.tok_embed_shape;
 
-        let tok_embed_q4 =
-            Q4Tensor::from_q4_bytes(&self.tok_embed_q4_bytes, [vocab, d_model], &self.device)?;
+        let tok_embed_q4 = Q4Tensor::from_quantized_bytes(
+            &self.tok_embed_q4_bytes,
+            [vocab, d_model],
+            self.tok_embed_dtype,
+            &self.device,
+        )?;
 
+        let quant_dtype = tok_embed_q4.dtype();
         let tok_embeddings = TokEmbedStore::Q4 {
             lm_head: super::linear::Q4Linear::new(tok_embed_q4, None),
             cpu_bytes: self.tok_embed_q4_bytes,
+            quant_dtype,
         };
 
         #[allow(unused_mut)]
@@ -180,7 +187,7 @@ impl<R: Read + Seek> Q4TtsModelLoader<R> {
         let fm_config = FmTransformerConfig::default();
         let codec_config = CodecDecoderConfig::default();
 
-        // Extract raw Q4 bytes for token embeddings (don't dequantize yet)
+        // Extract raw quantized bytes for token embeddings (don't dequantize yet)
         let tok_name = "mm_audio_embeddings.tok_embeddings.weight";
         let tok_info = self
             .reader
@@ -188,6 +195,7 @@ impl<R: Read + Seek> Q4TtsModelLoader<R> {
             .with_context(|| format!("Tensor '{tok_name}' not found"))?
             .clone();
         let tok_shape = reverse_gguf_dims(tok_info.shape());
+        let tok_embed_dtype = tok_info.dtype();
         let tok_embed_q4_bytes = self.reader.tensor_data(tok_name)?;
 
         info!(layers = config.n_layers, "Loading backbone layers");
@@ -213,6 +221,7 @@ impl<R: Read + Seek> Q4TtsModelLoader<R> {
             codec,
             tok_embed_q4_bytes,
             tok_embed_shape: [tok_shape[0], tok_shape[1]],
+            tok_embed_dtype,
             config,
             device: device.clone(),
         })
@@ -759,6 +768,12 @@ impl<R: Read + Seek> Q4TtsModelLoader<R> {
             GgmlDtype::Q4_0 => {
                 let bytes = self.reader.tensor_data(name)?;
                 let f32_data = dequantize_q4_0_cpu(&bytes, shape[0] * shape[1]);
+                let tensor_data = TensorData::new(f32_data, [shape[0], shape[1]]);
+                Ok(Tensor::from_data(tensor_data, device))
+            }
+            GgmlDtype::Q8_0 => {
+                let bytes = self.reader.tensor_data(name)?;
+                let f32_data = dequantize_q8_0_cpu(&bytes, shape[0] * shape[1]);
                 let tensor_data = TensorData::new(f32_data, [shape[0], shape[1]]);
                 Ok(Tensor::from_data(tensor_data, device))
             }

@@ -137,22 +137,30 @@ impl Q4TtsBackbone {
                 let selected = embed.clone().select(0, flat_ids);
                 selected.reshape([batch, seq, self.d_model])
             }
-            TokEmbedStore::Q4 { cpu_bytes, .. } => {
-                self.embed_from_q4_bytes(cpu_bytes, ids, batch, seq)
-            }
+            TokEmbedStore::Q4 {
+                cpu_bytes,
+                quant_dtype,
+                ..
+            } => self.embed_from_quantized_bytes(cpu_bytes, *quant_dtype, ids, batch, seq),
         }
     }
 
-    /// Dequantize specific rows from CPU Q4 bytes.
-    fn embed_from_q4_bytes(
+    /// Dequantize specific rows from CPU quantized bytes (Q4_0 or Q8_0).
+    fn embed_from_quantized_bytes(
         &self,
         cpu_bytes: &[u8],
+        dtype: super::reader::GgmlDtype,
         ids: &[i32],
         batch: usize,
         seq: usize,
     ) -> Tensor<Wgpu, 3> {
         let blocks_per_row = self.d_model / 32;
-        let bytes_per_row = blocks_per_row * 18;
+        let block_bytes = match dtype {
+            super::reader::GgmlDtype::Q4_0 => 18,
+            super::reader::GgmlDtype::Q8_0 => 34,
+            _ => unreachable!("embed_from_quantized_bytes only supports Q4_0 and Q8_0"),
+        };
+        let bytes_per_row = blocks_per_row * block_bytes;
         let mut output = vec![0.0f32; ids.len() * self.d_model];
 
         for (i, &id) in ids.iter().enumerate() {
@@ -160,17 +168,39 @@ impl Q4TtsBackbone {
             let row_bytes = &cpu_bytes[row_offset..row_offset + bytes_per_row];
             let out_slice = &mut output[i * self.d_model..(i + 1) * self.d_model];
 
-            for block in 0..blocks_per_row {
-                let bo = block * 18;
-                let d =
-                    half::f16::from_bits(u16::from_le_bytes([row_bytes[bo], row_bytes[bo + 1]]))
+            match dtype {
+                super::reader::GgmlDtype::Q4_0 => {
+                    for block in 0..blocks_per_row {
+                        let bo = block * 18;
+                        let d = half::f16::from_bits(u16::from_le_bytes([
+                            row_bytes[bo],
+                            row_bytes[bo + 1],
+                        ]))
                         .to_f32();
-                let base = block * 32;
-                for j in 0..16 {
-                    let byte = row_bytes[bo + 2 + j];
-                    out_slice[base + j] = ((byte & 0x0F) as f32 - 8.0) * d;
-                    out_slice[base + j + 16] = (((byte >> 4) & 0x0F) as f32 - 8.0) * d;
+                        let base = block * 32;
+                        for j in 0..16 {
+                            let byte = row_bytes[bo + 2 + j];
+                            out_slice[base + j] = ((byte & 0x0F) as f32 - 8.0) * d;
+                            out_slice[base + j + 16] = (((byte >> 4) & 0x0F) as f32 - 8.0) * d;
+                        }
+                    }
                 }
+                super::reader::GgmlDtype::Q8_0 => {
+                    for block in 0..blocks_per_row {
+                        let bo = block * 34;
+                        let d = half::f16::from_bits(u16::from_le_bytes([
+                            row_bytes[bo],
+                            row_bytes[bo + 1],
+                        ]))
+                        .to_f32();
+                        let base = block * 32;
+                        for j in 0..32 {
+                            let val = row_bytes[bo + 2 + j] as i8;
+                            out_slice[base + j] = d * val as f32;
+                        }
+                    }
+                }
+                _ => unreachable!(),
             }
         }
 
