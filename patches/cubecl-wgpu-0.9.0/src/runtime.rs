@@ -12,7 +12,7 @@ use cubecl_runtime::{
     client::ComputeClient,
     logging::{ProfileLevel, ServerLogger},
 };
-use wgpu::{InstanceFlags, RequestAdapterOptions};
+use wgpu::{InstanceFlags};
 
 /// Runtime that uses the [wgpu] crate with the wgsl compiler. This is used in the Wgpu backend.
 /// For advanced configuration, use [`init_setup`] to pass in runtime options or to select a
@@ -387,14 +387,19 @@ async fn request_adapter(
         WgpuDevice::Existing(_) => {
             unreachable!("Cannot select an adapter for an existing device.")
         }
-        _ => instance
-            .request_adapter(&RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-            })
-            .await
-            .expect("No possible adapter available for backend. Falling back to first available."),
+        _ => {
+            let mut adapters = instance.enumerate_adapters(backend.into());
+            if adapters.is_empty() {
+                panic!("No possible adapter available for backend. Falling back to first available.");
+            }
+            // Prefer discrete GPU
+            adapters.sort_by_key(|a| match a.get_info().device_type {
+                wgpu::DeviceType::DiscreteGpu => 0,
+                wgpu::DeviceType::IntegratedGpu => 1,
+                _ => 2,
+            });
+            adapters.remove(0)
+        }
     };
 
     log::info!("Using adapter {:?}", adapter.get_info());
