@@ -109,6 +109,20 @@ cargo run --release --features "wgpu,cli,hub" --bin voxtral -- \
 cargo run --release --features "wgpu,cli,hub" --bin voxtral -- speak --list-voices
 ```
 
+#### Q8_0 (optional, near-lossless)
+
+Q8_0 sits between Q4 and BF16: ~4.5 GB on disk, audio quality much closer to BF16. There is no hosted Q8 GGUF — generate it locally from the BF16 weights:
+
+```bash
+# Quantize BF16 -> Q8_0 GGUF (~4.5 GB)
+uv run --with safetensors --with torch --with numpy scripts/quantize_tts_gguf.py \
+  models/voxtral-tts/ -o models/voxtral-tts-q8.gguf --quant-type q8_0
+
+# Synthesize with Q8
+cargo run --release --features "wgpu,cli,hub" --bin voxtral -- \
+  speak --text "Hello world" --voice casual_female --gguf models/voxtral-tts-q8.gguf
+```
+
 20 preset voices across 9 languages. The TTS pipeline runs backbone (Ministral 3B) autoregressive decoding, flow-matching acoustic prediction, and codec synthesis to produce 24 kHz audio.
 
 ## Architecture
