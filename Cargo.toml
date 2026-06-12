@@ -114,6 +114,11 @@ name = "q4_pipeline"
 harness = false
 required-features = ["wgpu"]
 
+[[bench]]
+name = "q8_ops"
+harness = false
+required-features = ["wgpu"]
+
 # WASM library target
 [lib]
 crate-type = ["cdylib", "rlib"]
