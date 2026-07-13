@@ -7,15 +7,20 @@
 #     "numpy",
 # ]
 # ///
-"""Quantize Voxtral 4B TTS weights from SafeTensors to GGUF v3 with Q4_0.
+"""Quantize Voxtral 4B TTS weights from SafeTensors to GGUF v3.
 
-Reads consolidated.safetensors, quantizes backbone + FM linear layers to Q4_0,
+Supports Q4_0 and Q8_0 quantization (selectable via --quant-type).
+
+Reads consolidated.safetensors, quantizes backbone + FM linear layers,
 keeps codec/norms/small tensors as F32, pre-fuses codec weight norms, and writes
 a valid GGUF v3 file consumable by the Rust reader in src/gguf/reader.rs.
 
 Usage:
     uv run --with safetensors --with torch --with numpy scripts/quantize_tts_gguf.py \\
-        models/voxtral-tts/ -o models/voxtral-tts-q4.gguf
+        models/voxtral-tts/ -o models/voxtral-tts-q8.gguf --quant-type q8_0
+
+    uv run --with safetensors --with torch --with numpy scripts/quantize_tts_gguf.py \\
+        models/voxtral-tts/ -o models/voxtral-tts-q4.gguf --quant-type q4_0
 """
 
 from __future__ import annotations
@@ -36,20 +41,27 @@ from safetensors.torch import load_file
 GGUF_MAGIC = 0x46554747  # "GGUF" LE
 GGUF_VERSION = 3
 ALIGNMENT = 32
+
+# Q4_0 block format: 2 bytes (f16 scale) + 16 bytes (packed nibbles) = 18 bytes per 32 elements
 Q4_BLOCK_SIZE = 32
-Q4_BLOCK_BYTES = 18  # 2 (f16 scale) + 16 (packed nibbles)
+Q4_BLOCK_BYTES = 18
+
+# Q8_0 block format: 2 bytes (f16 scale) + 32 bytes (signed int8) = 34 bytes per 32 elements
+Q8_BLOCK_SIZE = 32
+Q8_BLOCK_BYTES = 34
 
 # GGML dtype codes matching src/gguf/reader.rs GgmlDtype
 DTYPE_F32 = 0
 DTYPE_F16 = 1
 DTYPE_Q4_0 = 2
+DTYPE_Q8_0 = 8
 
 # ---------------------------------------------------------------------------
 # Quantization strategy
 # ---------------------------------------------------------------------------
 
-# Patterns for tensors that should be quantized to Q4_0 (large linear layers).
-Q4_PATTERNS: list[str] = [
+# Patterns for tensors that should be quantized (large linear layers).
+QUANT_PATTERNS: list[str] = [
     "layers.",  # backbone + FM transformer layers (attention + ffn)
     "mm_audio_embeddings.tok_embeddings.weight",
     "acoustic_transformer.llm_projection.weight",
@@ -77,12 +89,12 @@ WEIGHT_NORM_V_SUFFIX = ".parametrizations.weight.original1"
 
 
 def should_quantize(name: str) -> bool:
-    """Return True if this tensor should be Q4_0 quantized."""
+    """Return True if this tensor should be quantized."""
     # F32 patterns take priority — check exclusions first.
     for pat in F32_PATTERNS:
         if pat in name:
             return False
-    for pat in Q4_PATTERNS:
+    for pat in QUANT_PATTERNS:
         if pat in name:
             return True
     return False
@@ -182,6 +194,63 @@ def q4_byte_size(num_elements: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Q8_0 quantization
+# ---------------------------------------------------------------------------
+
+def quantize_q8_0(data: np.ndarray) -> bytes:
+    """Quantize a flat f32 array to Q8_0 format.
+
+    Block layout (34 bytes per 32 elements):
+      - bytes 0-1: f16 scale `d` (little-endian)
+      - bytes 2-33: 32 signed int8 values
+
+    Dequantization: value = scale * int8_value
+    """
+    data = data.astype(np.float32).ravel()
+    n = len(data)
+
+    # Pad to multiple of 32 if needed.
+    remainder = n % Q8_BLOCK_SIZE
+    if remainder != 0:
+        pad = Q8_BLOCK_SIZE - remainder
+        data = np.concatenate([data, np.zeros(pad, dtype=np.float32)])
+        n = len(data)
+
+    n_blocks = n // Q8_BLOCK_SIZE
+    output = bytearray(n_blocks * Q8_BLOCK_BYTES)
+
+    for b in range(n_blocks):
+        block = data[b * Q8_BLOCK_SIZE : (b + 1) * Q8_BLOCK_SIZE]
+        amax = float(np.max(np.abs(block)))
+        d = amax / 127.0
+        inv_d = 1.0 / d if d != 0.0 else 0.0
+
+        # Scale as f16 LE
+        d_f16 = np.float16(d)
+        offset = b * Q8_BLOCK_BYTES
+        struct.pack_into("<e", output, offset, float(d_f16))
+
+        # Quantize to signed int8
+        for i in range(Q8_BLOCK_SIZE):
+            v = float(block[i])
+            q = int(round(v * inv_d))
+            q = max(-128, min(127, q))
+            # Store as unsigned byte (two's complement)
+            output[offset + 2 + i] = q & 0xFF
+
+    return bytes(output)
+
+
+def q8_byte_size(num_elements: int) -> int:
+    """Compute Q8_0 byte size for a given element count (after padding to 32)."""
+    n = num_elements
+    remainder = n % Q8_BLOCK_SIZE
+    if remainder != 0:
+        n += Q8_BLOCK_SIZE - remainder
+    return (n // Q8_BLOCK_SIZE) * Q8_BLOCK_BYTES
+
+
+# ---------------------------------------------------------------------------
 # GGUF v3 writer helpers
 # ---------------------------------------------------------------------------
 
@@ -210,6 +279,7 @@ def align_offset(offset: int) -> int:
 
 def load_and_prepare_tensors(
     model_dir: Path,
+    quant_type: str,
 ) -> list[tuple[str, int, np.ndarray, list[int]]]:
     """Load SafeTensors, fuse weight norms, decide dtype for each tensor.
 
@@ -220,7 +290,23 @@ def load_and_prepare_tensors(
         print(f"Error: {st_path} not found", file=sys.stderr)
         sys.exit(1)
 
+    # Select quantization parameters
+    if quant_type == "q4_0":
+        quantize_fn = quantize_q4_0
+        dtype_code = DTYPE_Q4_0
+        block_size = Q4_BLOCK_SIZE
+        quant_label = "Q4_0"
+    elif quant_type == "q8_0":
+        quantize_fn = quantize_q8_0
+        dtype_code = DTYPE_Q8_0
+        block_size = Q8_BLOCK_SIZE
+        quant_label = "Q8_0"
+    else:
+        print(f"Error: unknown quant type '{quant_type}'", file=sys.stderr)
+        sys.exit(1)
+
     print(f"Loading {st_path} ...")
+    print(f"Quantization: {quant_label}")
     state_dict = load_file(str(st_path), device="cpu")
 
     # -----------------------------------------------------------------------
@@ -271,14 +357,14 @@ def load_and_prepare_tensors(
         arr = tensor.numpy()
 
         if should_quantize(name):
-            data = quantize_q4_0(arr)
+            data = quantize_fn(arr)
             # Adjust shape if padding was needed.
             n_elem = int(np.prod(shape))
-            if n_elem % Q4_BLOCK_SIZE != 0:
-                # Pad last dimension to make total elements divisible by 32.
-                pad_needed = Q4_BLOCK_SIZE - (n_elem % Q4_BLOCK_SIZE)
+            if n_elem % block_size != 0:
+                # Pad last dimension to make total elements divisible by block_size.
+                pad_needed = block_size - (n_elem % block_size)
                 shape[-1] += pad_needed
-            results.append((name, DTYPE_Q4_0, data, shape))
+            results.append((name, dtype_code, data, shape))
         else:
             data = arr.astype(np.float32).tobytes()
             results.append((name, DTYPE_F32, data, shape))
@@ -303,7 +389,7 @@ def write_gguf(
 ) -> None:
     """Write GGUF v3 file from prepared tensors."""
     # Print summary table.
-    dtype_names = {DTYPE_F32: "F32", DTYPE_F16: "F16", DTYPE_Q4_0: "Q4_0"}
+    dtype_names = {DTYPE_F32: "F32", DTYPE_F16: "F16", DTYPE_Q4_0: "Q4_0", DTYPE_Q8_0: "Q8_0"}
     total_data = 0
     print(f"\n{'Tensor':<70} {'Dtype':<6} {'Shape':<25} {'Size':>12}")
     print("-" * 115)
@@ -379,7 +465,7 @@ def write_gguf(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Quantize Voxtral 4B TTS to GGUF v3 with Q4_0"
+        description="Quantize Voxtral 4B TTS to GGUF v3 with Q4_0 or Q8_0"
     )
     parser.add_argument(
         "model_dir",
@@ -390,8 +476,14 @@ def main() -> None:
         "-o",
         "--output",
         type=Path,
-        default=Path("voxtral-tts-q4.gguf"),
-        help="Output GGUF path (default: voxtral-tts-q4.gguf)",
+        default=None,
+        help="Output GGUF path (default: voxtral-tts-{quant_type}.gguf)",
+    )
+    parser.add_argument(
+        "--quant-type",
+        choices=["q4_0", "q8_0"],
+        default="q8_0",
+        help="Quantization type (default: q8_0)",
     )
     parser.add_argument(
         "--dry-run",
@@ -404,7 +496,10 @@ def main() -> None:
         print(f"Error: {args.model_dir} is not a directory", file=sys.stderr)
         sys.exit(1)
 
-    tensors = load_and_prepare_tensors(args.model_dir)
+    if args.output is None:
+        args.output = Path(f"voxtral-tts-{args.quant_type.replace('_', '')}.gguf")
+
+    tensors = load_and_prepare_tensors(args.model_dir, args.quant_type)
     write_gguf(tensors, args.output, dry_run=args.dry_run)
 
 

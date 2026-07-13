@@ -1,7 +1,7 @@
-//! Unit tests for Q4_0 quantization pipeline.
+//! Unit tests for the Q4_0/Q8_0 quantization pipeline.
 //!
-//! Tests cover: GGUF parsing, Q4_0 block dequantization, and GPU q4_matmul
-//! at various shapes including real model dimensions.
+//! Tests cover: GGUF parsing, Q4_0/Q8_0 block dequantization, and GPU
+//! q4_matmul/q8_matmul at various shapes including real model dimensions.
 
 #[cfg(test)]
 mod tests {
@@ -691,5 +691,420 @@ mod tests {
             "Max diff {:.4e} exceeds tolerance 1e-3",
             max_diff
         );
+    }
+
+    // =========================================================================
+    // CPU-side Q8_0 helpers (test-only)
+    // =========================================================================
+
+    const Q8_BLOCK_SIZE: usize = 32;
+    const Q8_BLOCK_BYTES: usize = 34;
+
+    /// Quantize f32 data to Q8_0 format (GGML standard).
+    /// Input length must be a multiple of 32.
+    /// Returns raw bytes: 34 bytes per block (2 f16 scale + 32 int8 values).
+    fn quantize_f32_to_q8_0(data: &[f32]) -> Vec<u8> {
+        assert_eq!(
+            data.len() % Q8_BLOCK_SIZE,
+            0,
+            "Data length {} is not a multiple of {}",
+            data.len(),
+            Q8_BLOCK_SIZE
+        );
+        let n_blocks = data.len() / Q8_BLOCK_SIZE;
+        let mut output = Vec::with_capacity(n_blocks * Q8_BLOCK_BYTES);
+
+        for block_idx in 0..n_blocks {
+            let block = &data[block_idx * Q8_BLOCK_SIZE..(block_idx + 1) * Q8_BLOCK_SIZE];
+
+            // Find absmax to compute scale
+            let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let d = amax / 127.0;
+            let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+
+            // Write scale as f16 (2 bytes LE)
+            let d_f16 = half::f16::from_f32(d);
+            output.extend_from_slice(&d_f16.to_le_bytes());
+
+            // Write 32 signed 8-bit values
+            for &v in block {
+                let q = (v * id).round().clamp(-127.0, 127.0) as i8;
+                output.push(q as u8);
+            }
+        }
+        output
+    }
+
+    /// Dequantize Q8_0 bytes back to f32.
+    fn dequantize_q8_0_to_f32(q8_bytes: &[u8], n_elements: usize) -> Vec<f32> {
+        assert_eq!(
+            n_elements % Q8_BLOCK_SIZE,
+            0,
+            "Element count {} is not a multiple of {}",
+            n_elements,
+            Q8_BLOCK_SIZE
+        );
+        let n_blocks = n_elements / Q8_BLOCK_SIZE;
+        assert_eq!(q8_bytes.len(), n_blocks * Q8_BLOCK_BYTES);
+        let mut output = vec![0.0f32; n_elements];
+
+        for block_idx in 0..n_blocks {
+            let offset = block_idx * Q8_BLOCK_BYTES;
+            let d_bits = u16::from_le_bytes([q8_bytes[offset], q8_bytes[offset + 1]]);
+            let d = half::f16::from_bits(d_bits).to_f32();
+
+            let base = block_idx * Q8_BLOCK_SIZE;
+            for i in 0..Q8_BLOCK_SIZE {
+                let val = q8_bytes[offset + 2 + i] as i8;
+                output[base + i] = d * val as f32;
+            }
+        }
+        output
+    }
+
+    /// Build a minimal GGUF v3 file in memory with one Q8_0 tensor.
+    fn build_minimal_gguf_q8(tensor_name: &str, shape: &[u64], q8_data: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Header
+        buf.extend_from_slice(&0x46554747u32.to_le_bytes()); // magic "GGUF"
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version
+        buf.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&1u64.to_le_bytes()); // metadata_kv_count
+
+        // Metadata KV: general.architecture = "voxtral"
+        write_gguf_string(&mut buf, "general.architecture");
+        buf.extend_from_slice(&8u32.to_le_bytes()); // value type: STRING
+        write_gguf_string(&mut buf, "voxtral");
+
+        // Tensor info
+        write_gguf_string(&mut buf, tensor_name);
+        buf.extend_from_slice(&(shape.len() as u32).to_le_bytes()); // n_dimensions
+        for &dim in shape {
+            buf.extend_from_slice(&dim.to_le_bytes());
+        }
+        buf.extend_from_slice(&8u32.to_le_bytes()); // dtype: Q8_0
+        buf.extend_from_slice(&0u64.to_le_bytes()); // offset (relative to data start)
+
+        // Alignment padding to 32 bytes
+        let alignment = 32;
+        let padding = (alignment - (buf.len() % alignment)) % alignment;
+        buf.extend(std::iter::repeat_n(0u8, padding));
+
+        // Tensor data
+        buf.extend_from_slice(q8_data);
+
+        buf
+    }
+
+    // =========================================================================
+    // Q8_0 block-level dequantization tests (CPU-only, no GPU needed)
+    // =========================================================================
+
+    #[test]
+    fn test_q8_block_dequant() {
+        // 32 values spanning [-1, 1]
+        let original: Vec<f32> = (0..32).map(|i| (i as f32 - 15.5) / 15.5).collect();
+
+        let q8_bytes = quantize_f32_to_q8_0(&original);
+        assert_eq!(q8_bytes.len(), Q8_BLOCK_BYTES, "One Q8_0 block = 34 bytes");
+
+        // Verify scale
+        let d_bits = u16::from_le_bytes([q8_bytes[0], q8_bytes[1]]);
+        let d = half::f16::from_bits(d_bits).to_f32();
+        let expected_d = original.iter().map(|v| v.abs()).fold(0.0f32, f32::max) / 127.0;
+        assert!(
+            (d - expected_d).abs() < 0.001,
+            "Scale mismatch: got {}, expected {}",
+            d,
+            expected_d
+        );
+
+        // Dequantize and compare — Q8 half-step is d/2 ≈ 0.004 for [-1, 1] data
+        let dequantized = dequantize_q8_0_to_f32(&q8_bytes, 32);
+        assert_eq!(dequantized.len(), 32);
+
+        let mut max_diff: f32 = 0.0;
+        for (a, b) in dequantized.iter().zip(original.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        println!(
+            "Q8 block dequant max diff: {:.4e} (scale d={:.6})",
+            max_diff, d
+        );
+        assert!(
+            max_diff < 0.005,
+            "Max diff {:.4e} exceeds tolerance 0.005",
+            max_diff
+        );
+    }
+
+    #[test]
+    fn test_q8_block_edge_cases() {
+        // All zeros
+        let zeros = vec![0.0f32; 32];
+        let q8_zeros = quantize_f32_to_q8_0(&zeros);
+        let deq_zeros = dequantize_q8_0_to_f32(&q8_zeros, 32);
+        for (i, v) in deq_zeros.iter().enumerate() {
+            assert_eq!(*v, 0.0, "Zero block element {} should be 0.0, got {}", i, v);
+        }
+
+        // All same value
+        let uniform = vec![0.5f32; 32];
+        let q8_uniform = quantize_f32_to_q8_0(&uniform);
+        let deq_uniform = dequantize_q8_0_to_f32(&q8_uniform, 32);
+        let mut max_diff: f32 = 0.0;
+        for (a, b) in deq_uniform.iter().zip(uniform.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        assert!(
+            max_diff < 0.005,
+            "Uniform block max diff {:.4e} exceeds tolerance",
+            max_diff
+        );
+
+        // Large values — error bounded by one quantization step
+        let large: Vec<f32> = (0..32).map(|i| (i as f32 - 15.5) * 100.0).collect();
+        let q8_large = quantize_f32_to_q8_0(&large);
+        let deq_large = dequantize_q8_0_to_f32(&q8_large, 32);
+        let d_large = large.iter().map(|v| v.abs()).fold(0.0f32, f32::max) / 127.0;
+        let mut max_diff: f32 = 0.0;
+        for (a, b) in deq_large.iter().zip(large.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        assert!(
+            max_diff < d_large,
+            "Large block max diff {:.4e} exceeds one step {:.4e}",
+            max_diff,
+            d_large
+        );
+    }
+
+    // =========================================================================
+    // GGUF reader Q8_0 dtype test
+    // =========================================================================
+
+    #[test]
+    fn test_gguf_reader_q8_dtype() {
+        // Create a 32x64 Q8_0 tensor
+        let n_elements = 32 * 64;
+        let original: Vec<f32> = (0..n_elements)
+            .map(|i| ((i as f32) * 0.001 - 1.0).sin())
+            .collect();
+        let q8_data = quantize_f32_to_q8_0(&original);
+
+        let gguf_bytes = build_minimal_gguf_q8("test.weight", &[32, 64], &q8_data);
+
+        let mut reader = GgufReader::from_bytes(&gguf_bytes).expect("Failed to parse GGUF");
+
+        assert_eq!(reader.version(), 3);
+        assert_eq!(reader.tensor_count(), 1);
+
+        let tensor_info = reader.tensor_info("test.weight").expect("Tensor not found");
+        assert_eq!(tensor_info.shape(), &[32, 64]);
+        assert_eq!(tensor_info.dtype(), GgmlDtype::Q8_0);
+
+        let raw = reader.tensor_data("test.weight").expect("Data not found");
+        assert_eq!(raw.len(), q8_data.len());
+        assert_eq!(raw, q8_data.as_slice());
+    }
+
+    // =========================================================================
+    // Q8 GPU dequantization test
+    // =========================================================================
+
+    #[test]
+    fn test_q8_dequantize_gpu() {
+        let device = Default::default();
+
+        let rows = 16;
+        let cols = 16;
+        let n_elements = rows * cols;
+        let original: Vec<f32> = (0..n_elements)
+            .map(|i| ((i as f32) * 0.05 - 6.4).sin() * 0.3)
+            .collect();
+
+        let q8_bytes = quantize_f32_to_q8_0(&original);
+        let expected = dequantize_q8_0_to_f32(&q8_bytes, n_elements);
+
+        let q8_tensor = Q4Tensor::from_q8_bytes(&q8_bytes, [rows, cols], &device)
+            .expect("Failed to create Q8 tensor");
+        let dequantized = q8_tensor.dequantize();
+
+        assert_eq!(dequantized.dims(), [rows, cols]);
+
+        let deq_data = dequantized.to_data();
+        let deq_slice = deq_data.as_slice::<f32>().unwrap();
+
+        let mut max_diff: f32 = 0.0;
+        for (a, b) in deq_slice.iter().zip(expected.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        println!("Q8 GPU dequantize max diff: {:.4e}", max_diff);
+        assert!(
+            max_diff < 1e-5,
+            "Max diff {:.4e} exceeds tolerance 1e-5",
+            max_diff
+        );
+    }
+
+    #[test]
+    fn test_q8_byte_count_validation() {
+        let device = Default::default();
+
+        // Wrong byte count: 32x32 elements = 32 blocks = 1088 bytes, give 1087
+        let bad_bytes = vec![0u8; 1087];
+        assert!(
+            Q4Tensor::from_q8_bytes(&bad_bytes, [32, 32], &device).is_err(),
+            "Byte count mismatch should be rejected"
+        );
+
+        // Element count not divisible by 32
+        let bytes = vec![0u8; 34];
+        assert!(
+            Q4Tensor::from_q8_bytes(&bytes, [3, 11], &device).is_err(),
+            "Element count not divisible by 32 should be rejected"
+        );
+    }
+
+    // =========================================================================
+    // q8_matmul kernel tests
+    // =========================================================================
+
+    #[test]
+    fn test_q8_matmul_small() {
+        let device = Default::default();
+
+        let k = 32;
+        let n = 32;
+
+        // Known weights [N, K] = [32, 32] (out_features, in_features)
+        let weights_f32: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.1).sin() * 0.5).collect();
+
+        let q8_bytes = quantize_f32_to_q8_0(&weights_f32);
+        let weights_deq = dequantize_q8_0_to_f32(&q8_bytes, n * k);
+
+        // Activations [1, 1, K]
+        let act_data: Vec<f32> = (0..k).map(|i| (i as f32) * 0.1).collect();
+
+        // CPU reference: [1, K] × [N, K]^T -> [1, N]
+        let expected = reference_matmul(&act_data, &weights_deq, 1, k, n);
+
+        // GPU path
+        let activations =
+            Tensor::<TestBackend, 3>::from_data(TensorData::new(act_data, [1, 1, k]), &device);
+        let q8_tensor = Q4Tensor::from_q8_bytes(&q8_bytes, [n, k], &device)
+            .expect("Failed to create Q8 tensor");
+        let output = q8_matmul(activations, &q8_tensor);
+
+        assert_eq!(output.dims(), [1, 1, n]);
+
+        let output_data = output.to_data();
+        let output_slice = output_data.as_slice::<f32>().unwrap();
+
+        let mut max_diff: f32 = 0.0;
+        for (a, b) in output_slice.iter().zip(expected.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        println!("Q8 matmul small max diff: {:.4e}", max_diff);
+        assert!(
+            max_diff < 1e-3,
+            "Max diff {:.4e} exceeds tolerance 1e-3",
+            max_diff
+        );
+    }
+
+    #[test]
+    fn test_q8_matmul_shapes() {
+        let device = Default::default();
+
+        // (batch, seq, K, N, tolerance, description)
+        // Goes through quantized_matmul to also cover the dtype dispatch.
+        let shapes: &[(usize, usize, usize, usize, f32, &str)] = &[
+            (1, 1, 128, 64, 1e-2, "small projection"),
+            (1, 10, 3072, 3072, 1e-2, "decoder attention wq"),
+            (1, 1, 3072, 9216, 1e-2, "decoder FFN w1"),
+        ];
+
+        for &(batch, seq, k, n, tol, desc) in shapes {
+            println!(
+                "Testing shape: {} [{}x{}x{}] x [{}x{}]^T",
+                desc, batch, seq, k, n, k
+            );
+
+            let act_data: Vec<f32> = (0..batch * seq * k)
+                .map(|i| ((i as f32) * 0.001).sin() * 0.1)
+                .collect();
+            // Weights in [N, K] layout (out_features, in_features)
+            let weight_data: Vec<f32> = (0..n * k)
+                .map(|i| ((i as f32) * 0.0007).cos() * 0.05)
+                .collect();
+
+            let q8_bytes = quantize_f32_to_q8_0(&weight_data);
+            let weight_deq = dequantize_q8_0_to_f32(&q8_bytes, n * k);
+
+            // Reference: Burn f32 matmul — dequantized weights are [N, K],
+            // transpose to [K, N] for standard matmul
+            let act_tensor = Tensor::<TestBackend, 3>::from_data(
+                TensorData::new(act_data, [batch, seq, k]),
+                &device,
+            );
+            let weight_deq_tensor =
+                Tensor::<TestBackend, 2>::from_data(TensorData::new(weight_deq, [n, k]), &device);
+            let expected = act_tensor
+                .clone()
+                .matmul(weight_deq_tensor.transpose().unsqueeze::<3>());
+
+            // Q8 GPU path via the dtype-dispatching entry point
+            let q8_tensor = Q4Tensor::from_q8_bytes(&q8_bytes, [n, k], &device)
+                .expect("Failed to create Q8 tensor");
+            let output = quantized_matmul(act_tensor, &q8_tensor);
+
+            assert_eq!(output.dims(), [batch, seq, n]);
+
+            let output_data = output.to_data();
+            let expected_data = expected.to_data();
+            let out_slice = output_data.as_slice::<f32>().unwrap();
+            let exp_slice = expected_data.as_slice::<f32>().unwrap();
+
+            let mut max_diff: f32 = 0.0;
+            for (a, b) in out_slice.iter().zip(exp_slice.iter()) {
+                max_diff = max_diff.max((a - b).abs());
+            }
+            println!("  Q8 matmul {} max diff: {:.4e}", desc, max_diff);
+            assert!(
+                max_diff < tol,
+                "Q8 matmul {} max diff {:.4e} exceeds tolerance {:.4e}",
+                desc,
+                max_diff,
+                tol
+            );
+        }
+    }
+
+    // =========================================================================
+    // Q8-backed linear test
+    // =========================================================================
+
+    #[test]
+    fn test_q8_linear_forward_shape() {
+        let device = Default::default();
+
+        let in_features = 128;
+        let out_features = 64;
+
+        let weight_data: Vec<f32> = (0..out_features * in_features)
+            .map(|i| ((i as f32) * 0.001).sin() * 0.1)
+            .collect();
+        let q8_bytes = quantize_f32_to_q8_0(&weight_data);
+
+        let q8_tensor = Q4Tensor::from_q8_bytes(&q8_bytes, [out_features, in_features], &device)
+            .expect("Failed to create Q8 tensor");
+        let linear = Q4Linear::new(q8_tensor, None);
+
+        let input = Tensor::<TestBackend, 3>::zeros([2, 5, in_features], &device);
+        let output = linear.forward(input);
+
+        assert_eq!(output.dims(), [2, 5, out_features]);
     }
 }
