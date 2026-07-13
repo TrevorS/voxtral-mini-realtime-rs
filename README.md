@@ -109,12 +109,15 @@ cargo run --release --features "wgpu,cli,hub" --bin voxtral -- \
 cargo run --release --features "wgpu,cli,hub" --bin voxtral -- speak --list-voices
 ```
 
-#### Q8_0 (optional, near-lossless)
+#### Q8_0 (optional, experimental)
 
-Q8_0 sits between Q4 and BF16: ~4.5 GB on disk, audio quality much closer to BF16. There is no hosted Q8 GGUF — generate it locally from the BF16 weights:
+The Q8_0 block layout suggests an approximately 4.5 GB GGUF on disk. This
+validation does not include a generated full-model Q8 file or listening-quality
+evaluation. There is no hosted Q8 GGUF; generate one locally from the BF16
+weights to evaluate it in your own environment:
 
 ```bash
-# Quantize BF16 -> Q8_0 GGUF (~4.5 GB)
+# Quantize BF16 -> Q8_0 GGUF (approximately 4.5 GB from the block layout)
 uv run --with safetensors --with torch --with numpy scripts/quantize_tts_gguf.py \
   models/voxtral-tts/ -o models/voxtral-tts-q8.gguf --quant-type q8_0
 
