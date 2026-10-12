@@ -30,7 +30,7 @@ use super::model::{
 use super::reader::{GgmlDtype, GgufReader, ShardedCursor};
 use super::tensor::Q4Tensor;
 
-/// All Q4 model components with token embeddings still in raw Q4 form.
+/// All Q4 model components with token embeddings still in raw quantized form.
 ///
 /// Used by [`Q4ModelLoader::load_deferred`] to allow freeing the GGUF
 /// reader's memory (potentially >2 GB of shard data) before dequantizing
@@ -43,6 +43,7 @@ pub struct Q4ModelParts {
     pub decoder_norm: RmsNorm<Wgpu>,
     pub tok_embed_q4_bytes: Vec<u8>,
     pub tok_embed_shape: [usize; 2],
+    pub tok_embed_dtype: GgmlDtype,
 }
 
 impl Q4ModelParts {
@@ -54,9 +55,13 @@ impl Q4ModelParts {
     pub fn finalize(self, device: &WgpuDevice) -> Result<Q4VoxtralModel> {
         let [vocab, d_model] = self.tok_embed_shape;
 
-        // Create Q4Tensor on GPU for the lm_head matmul
-        let tok_embed_q4 =
-            Q4Tensor::from_q4_bytes(&self.tok_embed_q4_bytes, [vocab, d_model], device)?;
+        // Create quantized tensor on GPU for the lm_head matmul
+        let tok_embed_q4 = Q4Tensor::from_quantized_bytes(
+            &self.tok_embed_q4_bytes,
+            [vocab, d_model],
+            self.tok_embed_dtype,
+            device,
+        )?;
 
         let decoder = Q4LanguageModel::new_q4_embeddings(
             tok_embed_q4,
@@ -150,7 +155,7 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
         info!("Loading audio-language adapter");
         let adapter = self.load_adapter(device)?;
 
-        // Extract raw Q4 bytes for token embeddings (don't dequantize yet)
+        // Extract raw quantized bytes for token embeddings (don't dequantize yet)
         let tok_name = prefixes::TOK_EMBEDDINGS;
         let tok_info = self
             .reader
@@ -158,6 +163,7 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
             .with_context(|| format!("Tensor '{tok_name}' not found"))?
             .clone();
         let tok_shape = reverse_gguf_dims(tok_info.shape());
+        let tok_embed_dtype = tok_info.dtype();
         let tok_embed_q4_bytes = self.reader.tensor_data(tok_name)?;
 
         info!(layers = 26, "Loading decoder layers");
@@ -184,6 +190,7 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
             decoder_norm,
             tok_embed_q4_bytes,
             tok_embed_shape: [tok_shape[0], tok_shape[1]],
+            tok_embed_dtype,
         })
     }
 
@@ -319,6 +326,12 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
                 let tensor_data = TensorData::new(f32_data, [shape[0], shape[1]]);
                 Ok(Tensor::from_data(tensor_data, device))
             }
+            GgmlDtype::Q8_0 => {
+                let bytes = self.reader.tensor_data(name)?;
+                let f32_data = dequantize_q8_0_cpu(&bytes, shape[0] * shape[1]);
+                let tensor_data = TensorData::new(f32_data, [shape[0], shape[1]]);
+                Ok(Tensor::from_data(tensor_data, device))
+            }
             GgmlDtype::F32 | GgmlDtype::F16 => self.load_f32_tensor(name, device),
             #[allow(unreachable_patterns)]
             other => bail!("Unsupported dtype {other:?} for tok_embeddings"),
@@ -425,7 +438,7 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
 // Shared GGUF loading helpers (used by both ASR and TTS loaders)
 // ---------------------------------------------------------------------------
 
-/// Load a Q4_0 tensor as a [`Q4Linear`] (no bias).
+/// Load a quantized tensor (Q4_0 or Q8_0) as a [`Q4Linear`] (no bias).
 pub(crate) fn gguf_load_q4_linear<R: Read + Seek>(
     reader: &mut GgufReader<R>,
     name: &str,
@@ -436,17 +449,18 @@ pub(crate) fn gguf_load_q4_linear<R: Read + Seek>(
         .with_context(|| format!("Tensor '{name}' not found"))?
         .clone();
 
-    if info.dtype() != GgmlDtype::Q4_0 {
-        bail!("Expected Q4_0 for '{name}', got {:?}", info.dtype());
+    let dtype = info.dtype();
+    if !dtype.is_quantized() {
+        bail!("Expected quantized type (Q4_0 or Q8_0) for '{name}', got {dtype:?}");
     }
 
     let shape = reverse_gguf_dims(info.shape());
     let bytes = reader.tensor_data(name)?;
-    let q4 = Q4Tensor::from_q4_bytes(&bytes, [shape[0], shape[1]], device)?;
-    Ok(Q4Linear::new(q4, None))
+    let tensor = Q4Tensor::from_quantized_bytes(&bytes, [shape[0], shape[1]], dtype, device)?;
+    Ok(Q4Linear::new(tensor, None))
 }
 
-/// Load a Q4_0 tensor with an optional F32 bias as a [`Q4Linear`].
+/// Load a quantized tensor (Q4_0 or Q8_0) with an optional F32 bias as a [`Q4Linear`].
 pub(crate) fn gguf_load_q4_linear_with_optional_bias<R: Read + Seek>(
     reader: &mut GgufReader<R>,
     weight_name: &str,
@@ -458,13 +472,14 @@ pub(crate) fn gguf_load_q4_linear_with_optional_bias<R: Read + Seek>(
         .with_context(|| format!("Tensor '{weight_name}' not found"))?
         .clone();
 
-    if info.dtype() != GgmlDtype::Q4_0 {
-        bail!("Expected Q4_0 for '{weight_name}', got {:?}", info.dtype());
+    let dtype = info.dtype();
+    if !dtype.is_quantized() {
+        bail!("Expected quantized type (Q4_0 or Q8_0) for '{weight_name}', got {dtype:?}");
     }
 
     let shape = reverse_gguf_dims(info.shape());
     let bytes = reader.tensor_data(weight_name)?;
-    let q4 = Q4Tensor::from_q4_bytes(&bytes, [shape[0], shape[1]], device)?;
+    let tensor = Q4Tensor::from_quantized_bytes(&bytes, [shape[0], shape[1]], dtype, device)?;
 
     let bias = if let Some(bias_name) = bias_name {
         if reader.tensor_info(bias_name).is_some() {
@@ -477,7 +492,7 @@ pub(crate) fn gguf_load_q4_linear_with_optional_bias<R: Read + Seek>(
         None
     };
 
-    Ok(Q4Linear::new(q4, bias))
+    Ok(Q4Linear::new(tensor, bias))
 }
 
 /// Load an F32/F16 tensor from GGUF.
@@ -506,7 +521,12 @@ pub(crate) fn gguf_load_f32_tensor<R: Read + Seek, const D: usize>(
                 half::f16::from_bits(bits).to_f32()
             })
             .collect(),
-        GgmlDtype::Q4_0 => bail!("Cannot load Q4_0 tensor '{name}' as f32; use load_q4_linear"),
+        GgmlDtype::Q4_0 | GgmlDtype::Q8_0 => {
+            bail!(
+                "Cannot load {:?} tensor '{name}' as f32; use load_q4_linear",
+                info.dtype()
+            )
+        }
     };
 
     let tensor_data = TensorData::new(data, shape);
@@ -554,6 +574,25 @@ pub(crate) fn dequantize_q4_0_cpu(raw: &[u8], num_elements: usize) -> Vec<f32> {
             let hi = ((byte >> 4) & 0x0F) as f32 - 8.0;
             output[base + i] = lo * d;
             output[base + i + 16] = hi * d;
+        }
+    }
+    output
+}
+
+/// Dequantize Q8_0 blocks on CPU, returning `num_elements` f32 values.
+///
+/// Q8_0 block: 2 bytes (f16 scale) + 32 bytes (signed int8 values) = 34 bytes per block.
+/// Dequant: value = scale * int8_value.
+pub(crate) fn dequantize_q8_0_cpu(raw: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 32;
+    let mut output = vec![0.0f32; num_elements];
+    for block_idx in 0..num_blocks {
+        let offset = block_idx * 34;
+        let d = half::f16::from_bits(u16::from_le_bytes([raw[offset], raw[offset + 1]])).to_f32();
+        let base = block_idx * 32;
+        for i in 0..32 {
+            let val = raw[offset + 2 + i] as i8;
+            output[base + i] = d * val as f32;
         }
     }
     output

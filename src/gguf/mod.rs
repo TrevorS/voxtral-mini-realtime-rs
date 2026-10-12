@@ -23,7 +23,7 @@ pub use model::{
     Q4AdaRmsNorm, Q4Adapter, Q4Attention, Q4AudioEncoder, Q4DecoderLayer, Q4EncoderLayer,
     Q4FeedForward, Q4LanguageModel, Q4VoxtralModel,
 };
-pub use op::q4_matmul;
+pub use op::{q4_matmul, q8_matmul, quantized_matmul};
 pub use reader::{GgmlDtype, GgufReader, GgufTensorInfo, ShardedCursor};
 pub use tensor::Q4Tensor;
 pub use tts_loader::{Q4TtsModelLoader, Q4TtsModelParts};

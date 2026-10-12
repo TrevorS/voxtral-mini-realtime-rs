@@ -1,14 +1,16 @@
-//! Fused Q4_0 dequant+matmul GPU kernel launch.
+//! Fused quantized dequant+matmul GPU kernel launch.
 //!
-//! [`q4_matmul`] launches a WGSL compute shader to perform
+//! [`q4_matmul`] and [`q8_matmul`] launch WGSL compute shaders to perform
 //! `output[B, M, N] = input[B, M, K] × weights[N, K]^T` where weights are in
-//! Q4_0 format with shape `[N, K]` (out_features, in_features).
+//! Q4_0 or Q8_0 format with shape `[N, K]` (out_features, in_features).
+//!
+//! [`quantized_matmul`] auto-dispatches based on the tensor's dtype.
 //!
 //! Two kernel variants are dispatched based on M:
-//! - **M ≤ threshold**: Tiled kernel with shared memory (shader.wgsl).
+//! - **M ≤ threshold**: Tiled kernel with shared memory (shader.wgsl / shader_q8.wgsl).
 //!   Cooperatively loads the input vector into workgroup shared memory,
 //!   eliminating redundant global reads. Uses 1D (128,1,1) workgroups.
-//! - **M > threshold**: Naive kernel (shader_naive.wgsl).
+//! - **M > threshold**: Naive kernel (shader_naive.wgsl / shader_naive_q8.wgsl).
 //!   One thread per output element with (16,16) workgroups — better for
 //!   multi-row matmuls where the 2D layout fills the GPU efficiently.
 //!
@@ -26,13 +28,14 @@ use cubecl::prelude::KernelId;
 use cubecl::server::{Bindings, CubeCount};
 use cubecl::CubeTask;
 
+use super::reader::GgmlDtype;
 use super::tensor::Q4Tensor;
 
 /// M threshold: use tiled kernel when M ≤ this, naive kernel otherwise.
 #[cfg(not(target_family = "wasm"))]
 const TILED_M_THRESHOLD: usize = 4;
 
-// -- Tiled kernel (shared memory, good for M=1 decode) --
+// -- Tiled kernels (shared memory, good for M=1 decode) --
 
 #[cfg(not(target_family = "wasm"))]
 const TILED_WG_X: u32 = 128;
@@ -54,7 +57,24 @@ impl KernelSource for Q4MatmulTiledKernel {
     }
 }
 
-// -- Naive kernel (one thread per element, good for M>1 prefill/encoder) --
+#[cfg(not(target_family = "wasm"))]
+struct Q8MatmulTiledKernel {
+    workgroup_size_x: u32,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl KernelSource for Q8MatmulTiledKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("shader_q8.wgsl"))
+            .register("workgroup_size_x", self.workgroup_size_x.to_string())
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>().info(self.workgroup_size_x)
+    }
+}
+
+// -- Naive kernels (one thread per element, good for M>1 prefill/encoder) --
 
 const NAIVE_WG_X: u32 = 16;
 const NAIVE_WG_Y: u32 = 16;
@@ -73,6 +93,35 @@ impl KernelSource for Q4MatmulNaiveKernel {
 
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info(self.workgroup_size_x * 1000 + self.workgroup_size_y)
+    }
+}
+
+struct Q8MatmulNaiveKernel {
+    workgroup_size_x: u32,
+    workgroup_size_y: u32,
+}
+
+impl KernelSource for Q8MatmulNaiveKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("shader_naive_q8.wgsl"))
+            .register("workgroup_size_x", self.workgroup_size_x.to_string())
+            .register("workgroup_size_y", self.workgroup_size_y.to_string())
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>().info(self.workgroup_size_x * 1000 + self.workgroup_size_y)
+    }
+}
+
+/// Fused quantized dequant+matmul on GPU, auto-dispatching by dtype.
+///
+/// Computes `output[B, M, N] = input[B, M, K] × weights[N, K]^T`.
+/// Supports both Q4_0 and Q8_0 weight tensors.
+pub fn quantized_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
+    match weights.dtype() {
+        GgmlDtype::Q4_0 => q4_matmul(input, weights),
+        GgmlDtype::Q8_0 => q8_matmul(input, weights),
+        other => panic!("quantized_matmul: unsupported dtype {other:?}"),
     }
 }
 
@@ -123,7 +172,7 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
         .with_buffer(output_handle.clone().binding())
         .with_buffer(info_handle.binding());
 
-    dispatch(&client, b, m, n, bindings);
+    dispatch_q4(&client, b, m, n, bindings);
 
     // Wrap output handle in a CubeTensor → Tensor
     let output_tensor = CubeTensor::new_contiguous(
@@ -136,12 +185,71 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
     Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
 }
 
-/// Dispatch the appropriate kernel variant.
+/// Fused Q8_0 dequant+matmul on GPU.
 ///
-/// On native: tiled for M ≤ 4 (decoder), naive for M > 4 (encoder/prefill).
-/// On WASM: always naive to avoid CubeCL bind group layout issues.
+/// Computes `output[B, M, N] = input[B, M, K] × weights[N, K]^T` where weights
+/// are stored in Q8_0 block format on the GPU with shape `[N, K]`
+/// (out_features, in_features), matching PyTorch/GGUF convention.
+pub fn q8_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
+    // Convert Tensor → CubeTensor and ensure contiguous layout
+    let cube_input: CubeTensor<WgpuRuntime> = input.into_primitive().tensor();
+    let cube_input = into_contiguous(cube_input);
+
+    // Extract dimensions
+    assert_eq!(cube_input.shape.num_dims(), 3, "Input must be 3D [B, M, K]");
+    let b = cube_input.shape.dims[0];
+    let m = cube_input.shape.dims[1];
+    let k = cube_input.shape.dims[2];
+    let [n, wk] = weights.shape();
+    assert_eq!(
+        k, wk,
+        "K dimension mismatch: input has {k}, weights have {wk}"
+    );
+
+    let client = cube_input.client.clone();
+    let device = cube_input.device.clone();
+    let blocks_per_row = k / 32;
+
+    // Allocate output buffer (B × M × N × 4 bytes for f32)
+    let output_handle = client.empty(b * m * n * 4);
+
+    // Info buffer: [B, M, K, N, blocks_per_row]
+    let info: [u32; 5] = [
+        b as u32,
+        m as u32,
+        k as u32,
+        n as u32,
+        blocks_per_row as u32,
+    ];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(weights.handle.clone().binding())
+        .with_buffer(cube_input.handle.clone().binding())
+        .with_buffer(output_handle.clone().binding())
+        .with_buffer(info_handle.binding());
+
+    dispatch_q8(&client, b, m, n, bindings);
+
+    // Wrap output handle in a CubeTensor → Tensor
+    let output_tensor = CubeTensor::new_contiguous(
+        client,
+        device,
+        burn::prelude::Shape::from(vec![b, m, n]),
+        output_handle,
+        DType::F32,
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
+}
+
+// ---------------------------------------------------------------------------
+// Q4 dispatch
+// ---------------------------------------------------------------------------
+
+/// Dispatch the appropriate Q4 kernel variant.
 #[cfg(not(target_family = "wasm"))]
-fn dispatch(
+fn dispatch_q4(
     client: &cubecl::client::ComputeClient<WgpuRuntime>,
     b: usize,
     m: usize,
@@ -165,22 +273,22 @@ fn dispatch(
             )
             .expect("Q4 tiled matmul kernel launch failed");
     } else {
-        dispatch_naive(client, b, m, n, bindings);
+        dispatch_q4_naive(client, b, m, n, bindings);
     }
 }
 
 #[cfg(target_family = "wasm")]
-fn dispatch(
+fn dispatch_q4(
     client: &cubecl::client::ComputeClient<WgpuRuntime>,
     b: usize,
     m: usize,
     n: usize,
     bindings: Bindings,
 ) {
-    dispatch_naive(client, b, m, n, bindings);
+    dispatch_q4_naive(client, b, m, n, bindings);
 }
 
-fn dispatch_naive(
+fn dispatch_q4_naive(
     client: &cubecl::client::ComputeClient<WgpuRuntime>,
     b: usize,
     m: usize,
@@ -203,4 +311,74 @@ fn dispatch_naive(
             bindings,
         )
         .expect("Q4 naive matmul kernel launch failed");
+}
+
+// ---------------------------------------------------------------------------
+// Q8 dispatch
+// ---------------------------------------------------------------------------
+
+/// Dispatch the appropriate Q8 kernel variant.
+#[cfg(not(target_family = "wasm"))]
+fn dispatch_q8(
+    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+    b: usize,
+    m: usize,
+    n: usize,
+    bindings: Bindings,
+) {
+    if m <= TILED_M_THRESHOLD {
+        let kernel = SourceKernel::new(
+            Q8MatmulTiledKernel {
+                workgroup_size_x: TILED_WG_X,
+            },
+            CubeDim::new_1d(TILED_WG_X),
+        );
+        let wg_x = n.div_ceil(TILED_WG_X as usize) as u32;
+        let wg_y = (b * m) as u32;
+        client
+            .launch(
+                Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                CubeCount::new_2d(wg_x, wg_y),
+                bindings,
+            )
+            .expect("Q8 tiled matmul kernel launch failed");
+    } else {
+        dispatch_q8_naive(client, b, m, n, bindings);
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn dispatch_q8(
+    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+    b: usize,
+    m: usize,
+    n: usize,
+    bindings: Bindings,
+) {
+    dispatch_q8_naive(client, b, m, n, bindings);
+}
+
+fn dispatch_q8_naive(
+    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+    b: usize,
+    m: usize,
+    n: usize,
+    bindings: Bindings,
+) {
+    let kernel = SourceKernel::new(
+        Q8MatmulNaiveKernel {
+            workgroup_size_x: NAIVE_WG_X,
+            workgroup_size_y: NAIVE_WG_Y,
+        },
+        CubeDim::new_2d(NAIVE_WG_X, NAIVE_WG_Y),
+    );
+    let wg_x = n.div_ceil(NAIVE_WG_X as usize) as u32;
+    let wg_y = (b * m).div_ceil(NAIVE_WG_Y as usize) as u32;
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_2d(wg_x, wg_y),
+            bindings,
+        )
+        .expect("Q8 naive matmul kernel launch failed");
 }

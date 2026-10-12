@@ -211,15 +211,20 @@ impl Q4Attention {
         fused_bytes.extend_from_slice(&wk_bytes);
         fused_bytes.extend_from_slice(&wv_bytes);
 
-        if let Ok(fused) =
-            super::tensor::Q4Tensor::from_q4_bytes(&fused_bytes, [q_out + k_out + v_out, k], device)
-        {
+        let dtype = self.wq.weights().dtype();
+        if let Ok(fused) = super::tensor::Q4Tensor::from_quantized_bytes(
+            &fused_bytes,
+            [q_out + k_out + v_out, k],
+            dtype,
+            device,
+        ) {
             self.fused_qkv = Some(super::linear::Q4FusedQKV::new(fused, q_out, k_out, v_out));
             tracing::debug!(
                 q_out,
                 k_out,
                 v_out,
-                "Fused QKV weights into single Q4 tensor"
+                ?dtype,
+                "Fused QKV weights into single quantized tensor"
             );
         }
     }
@@ -310,9 +315,13 @@ impl Q4FeedForward {
         fused_bytes.extend_from_slice(&w1_bytes);
         fused_bytes.extend_from_slice(&w3_bytes);
 
-        if let Ok(fused) =
-            super::tensor::Q4Tensor::from_q4_bytes(&fused_bytes, [w1_out + w3_out, k], device)
-        {
+        let dtype = self.w1.weights().dtype();
+        if let Ok(fused) = super::tensor::Q4Tensor::from_quantized_bytes(
+            &fused_bytes,
+            [w1_out + w3_out, k],
+            dtype,
+            device,
+        ) {
             self.fused_gate_up = Some(super::linear::Q4FusedGateUp::new(fused, w1_out, w3_out));
         }
     }
@@ -572,6 +581,8 @@ pub(crate) enum TokEmbedStore {
     Q4 {
         lm_head: Q4Linear,
         cpu_bytes: Vec<u8>,
+        /// The quantization type of the CPU bytes (Q4_0 or Q8_0).
+        quant_dtype: super::reader::GgmlDtype,
     },
 }
 
@@ -605,9 +616,9 @@ impl Q4LanguageModel {
         }
     }
 
-    /// Create a new Q4 language model with Q4 token embeddings.
+    /// Create a new Q4 language model with quantized token embeddings.
     ///
-    /// Keeps a CPU copy of the Q4 bytes for embed_tokens (small row lookups)
+    /// Keeps a CPU copy of the quantized bytes for embed_tokens (small row lookups)
     /// and a Q4Linear on GPU for the lm_head (full vocab matmul).
     #[allow(clippy::too_many_arguments)]
     pub fn new_q4_embeddings(
@@ -619,10 +630,12 @@ impl Q4LanguageModel {
         layers: Vec<Q4DecoderLayer>,
         norm: RmsNorm<Wgpu>,
     ) -> Self {
+        let quant_dtype = tok_embed_q4.dtype();
         Self {
             tok_embeddings: TokEmbedStore::Q4 {
                 lm_head: Q4Linear::new(tok_embed_q4, None),
                 cpu_bytes: tok_embed_bytes,
+                quant_dtype,
             },
             rope,
             layers,
@@ -645,13 +658,17 @@ impl Q4LanguageModel {
                 let selected = embed.clone().select(0, flat_ids);
                 selected.reshape([batch, seq, self.d_model])
             }
-            TokEmbedStore::Q4 { cpu_bytes, .. } => {
+            TokEmbedStore::Q4 {
+                cpu_bytes,
+                quant_dtype,
+                ..
+            } => {
                 let [batch, seq] = token_ids.dims();
                 let id_data = token_ids.into_data();
                 let ids: Vec<i32> = id_data
                     .to_vec()
                     .expect("tensor data extraction for token IDs");
-                self.embed_from_q4_bytes(cpu_bytes, &ids, batch, seq)
+                self.embed_from_quantized_bytes(cpu_bytes, *quant_dtype, &ids, batch, seq)
             }
         }
     }
@@ -668,22 +685,30 @@ impl Q4LanguageModel {
                 let selected = embed.clone().select(0, flat_ids);
                 selected.reshape([batch, seq, self.d_model])
             }
-            TokEmbedStore::Q4 { cpu_bytes, .. } => {
-                self.embed_from_q4_bytes(cpu_bytes, ids, batch, seq)
-            }
+            TokEmbedStore::Q4 {
+                cpu_bytes,
+                quant_dtype,
+                ..
+            } => self.embed_from_quantized_bytes(cpu_bytes, *quant_dtype, ids, batch, seq),
         }
     }
 
-    /// Dequantize specific rows from CPU Q4 bytes.
-    fn embed_from_q4_bytes(
+    /// Dequantize specific rows from CPU quantized bytes (Q4_0 or Q8_0).
+    fn embed_from_quantized_bytes(
         &self,
         cpu_bytes: &[u8],
+        dtype: super::reader::GgmlDtype,
         ids: &[i32],
         batch: usize,
         seq: usize,
     ) -> Tensor<Wgpu, 3> {
         let blocks_per_row = self.d_model / 32;
-        let bytes_per_row = blocks_per_row * 18;
+        let block_bytes = match dtype {
+            super::reader::GgmlDtype::Q4_0 => 18,
+            super::reader::GgmlDtype::Q8_0 => 34,
+            _ => unreachable!("embed_from_quantized_bytes only supports Q4_0 and Q8_0"),
+        };
+        let bytes_per_row = blocks_per_row * block_bytes;
         let mut output = vec![0.0f32; ids.len() * self.d_model];
 
         for (i, &id) in ids.iter().enumerate() {
@@ -691,17 +716,39 @@ impl Q4LanguageModel {
             let row_bytes = &cpu_bytes[row_offset..row_offset + bytes_per_row];
             let out_slice = &mut output[i * self.d_model..(i + 1) * self.d_model];
 
-            for block in 0..blocks_per_row {
-                let bo = block * 18;
-                let d =
-                    half::f16::from_bits(u16::from_le_bytes([row_bytes[bo], row_bytes[bo + 1]]))
+            match dtype {
+                super::reader::GgmlDtype::Q4_0 => {
+                    for block in 0..blocks_per_row {
+                        let bo = block * 18;
+                        let d = half::f16::from_bits(u16::from_le_bytes([
+                            row_bytes[bo],
+                            row_bytes[bo + 1],
+                        ]))
                         .to_f32();
-                let base = block * 32;
-                for j in 0..16 {
-                    let byte = row_bytes[bo + 2 + j];
-                    out_slice[base + j] = ((byte & 0x0F) as f32 - 8.0) * d;
-                    out_slice[base + j + 16] = (((byte >> 4) & 0x0F) as f32 - 8.0) * d;
+                        let base = block * 32;
+                        for j in 0..16 {
+                            let byte = row_bytes[bo + 2 + j];
+                            out_slice[base + j] = ((byte & 0x0F) as f32 - 8.0) * d;
+                            out_slice[base + j + 16] = (((byte >> 4) & 0x0F) as f32 - 8.0) * d;
+                        }
+                    }
                 }
+                super::reader::GgmlDtype::Q8_0 => {
+                    for block in 0..blocks_per_row {
+                        let bo = block * 34;
+                        let d = half::f16::from_bits(u16::from_le_bytes([
+                            row_bytes[bo],
+                            row_bytes[bo + 1],
+                        ]))
+                        .to_f32();
+                        let base = block * 32;
+                        for j in 0..32 {
+                            let val = row_bytes[bo + 2 + j] as i8;
+                            out_slice[base + j] = d * val as f32;
+                        }
+                    }
+                }
+                _ => unreachable!(),
             }
         }
 
